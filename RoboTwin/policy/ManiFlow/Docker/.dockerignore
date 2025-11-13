@@ -1,0 +1,36 @@
+# Data and outputs
+data/
+dataset/
+outputs/
+results/
+checkpoints/
+logs/
+assets/
+ckpts/
+*.ckpt
+*.pth
+*.pt
+*.zarr
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.env
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.log
