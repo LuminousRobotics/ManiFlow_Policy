@@ -55,10 +55,21 @@ from maniflow.model.common.lr_scheduler import get_scheduler
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 def _csv_log_epoch(output_dir, epoch, global_step, step_log):
-    """policy-training-pipeline patch 0002: append per-epoch metrics to results.csv."""
+    """policy-training-pipeline: append per-epoch metrics to results.csv.
+
+    W&B-parity column set — everything the training loop tracks per epoch:
+      losses:      train_loss, val_loss, bc_loss
+      flow/consist: loss_flow, loss_ct (train side) + val_loss_flow, val_loss_ct
+      health:      v_flow_pred_magnitude, v_ct_pred_magnitude (collapse detectors)
+      accuracy:    train_action_mse_error
+      optim:       lr, grad_norm, param_norm
+    Missing keys are written blank so the header stays stable across epochs."""
     import csv as _csv
-    fields = ['epoch', 'global_step', 'train_loss', 'loss_flow', 'loss_ct',
-              'val_loss', 'train_action_mse_error', 'lr']
+    fields = ['epoch', 'global_step',
+              'train_loss', 'val_loss', 'bc_loss',
+              'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
+              'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
+              'train_action_mse_error', 'lr', 'grad_norm', 'param_norm']
     row = {'epoch': epoch, 'global_step': global_step}
     for key in fields[2:]:
         value = step_log.get(key)
@@ -67,9 +78,22 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
         except (TypeError, ValueError):
             row[key] = ''
     path = os.path.join(str(output_dir), 'results.csv')
+    # If an older results.csv exists with a narrower header (e.g. resumed run),
+    # keep appending under the OLD header so the file stays valid; extra columns
+    # are dropped by DictWriter(extrasaction='ignore'). Fresh runs get the full set.
+    fieldnames = fields
     write_header = not os.path.exists(path)
+    if not write_header:
+        try:
+            with open(path, newline='') as fh:
+                existing = _csv.reader(fh)
+                hdr = next(existing, None)
+            if hdr:
+                fieldnames = hdr
+        except Exception:
+            pass
     with open(path, 'a', newline='') as fh:
-        writer = _csv.DictWriter(fh, fieldnames=fields)
+        writer = _csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore')
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -250,11 +274,21 @@ class TrainManiFlowRoboTwinWorkspace:
                     
                     loss = raw_loss / cfg.training.gradient_accumulate_every
                     loss.backward()
-                    
+
                     t1_2 = time.time()
 
                     # step optimizer
                     if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        # grad/weight norms (W&B-style diagnostics; cheap, informational)
+                        # captured after backward, before step, so they reflect this update.
+                        with torch.no_grad():
+                            g2 = 0.0; p2 = 0.0
+                            for p in self.model.parameters():
+                                if p.grad is not None:
+                                    g2 += float(p.grad.detach().norm(2).item() ** 2)
+                                p2 += float(p.detach().norm(2).item() ** 2)
+                            _grad_norm = g2 ** 0.5
+                            _param_norm = p2 ** 0.5
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         lr_scheduler.step()
@@ -273,6 +307,11 @@ class TrainManiFlowRoboTwinWorkspace:
                         'epoch': self.epoch,
                         'lr': lr_scheduler.get_last_lr()[0]
                     }
+                    try:
+                        step_log['grad_norm'] = _grad_norm
+                        step_log['param_norm'] = _param_norm
+                    except NameError:
+                        pass  # not an optimizer-step iteration (grad accumulation)
                     t1_5 = time.time()
                     step_log.update(loss_dict)
                     t2 = time.time()
@@ -333,7 +372,8 @@ class TrainManiFlowRoboTwinWorkspace:
             if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION:
                 with torch.no_grad():
                     val_losses = list()
-                    with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                    val_flow = list(); val_ct = list()
+                    with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -341,6 +381,11 @@ class TrainManiFlowRoboTwinWorkspace:
                             # Forward pass
                             loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
                             val_losses.append(loss)
+                            # keep the val-side flow/consistency split too (W&B parity)
+                            if loss_dict.get('loss_flow') is not None:
+                                val_flow.append(loss_dict['loss_flow'])
+                            if loss_dict.get('loss_ct') is not None:
+                                val_ct.append(loss_dict['loss_ct'])
                             print(f'epoch {self.epoch}, eval loss: ', float(loss.cpu()))
                             if (cfg.training.max_val_steps is not None) \
                                 and batch_idx >= (cfg.training.max_val_steps-1):
@@ -349,6 +394,10 @@ class TrainManiFlowRoboTwinWorkspace:
                         val_loss = torch.mean(torch.tensor(val_losses)).item()
                         # log epoch average validation loss
                         step_log['val_loss'] = val_loss
+                        if val_flow:
+                            step_log['val_loss_flow'] = float(np.mean(val_flow))
+                        if val_ct:
+                            step_log['val_loss_ct'] = float(np.mean(val_ct))
             
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
