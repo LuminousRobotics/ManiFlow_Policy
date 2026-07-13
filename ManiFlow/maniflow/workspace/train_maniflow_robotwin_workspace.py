@@ -44,7 +44,7 @@ sys.path.append('ManiFlow')
 sys.path.append('ManiFlow/maniflow')
 
 from hydra.core.hydra_config import HydraConfig
-from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
+from maniflow.policy.maniflow_image_policy import ManiFlowTransformerImagePolicy
 from maniflow.dataset.base_dataset import BaseDataset
 from maniflow.env_runner.base_runner import BaseRunner
 from maniflow.common.checkpoint_util import TopKCheckpointManager
@@ -53,6 +53,27 @@ from maniflow.model.diffusion.ema_model import EMAModel
 from maniflow.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+def _csv_log_epoch(output_dir, epoch, global_step, step_log):
+    """policy-training-pipeline patch 0002: append per-epoch metrics to results.csv."""
+    import csv as _csv
+    fields = ['epoch', 'global_step', 'train_loss', 'loss_flow', 'loss_ct',
+              'val_loss', 'train_action_mse_error', 'lr']
+    row = {'epoch': epoch, 'global_step': global_step}
+    for key in fields[2:]:
+        value = step_log.get(key)
+        try:
+            row[key] = float(value) if value is not None else ''
+        except (TypeError, ValueError):
+            row[key] = ''
+    path = os.path.join(str(output_dir), 'results.csv')
+    write_header = not os.path.exists(path)
+    with open(path, 'a', newline='') as fh:
+        writer = _csv.DictWriter(fh, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 class TrainManiFlowRoboTwinWorkspace:
     include_keys = ['global_step', 'epoch']
@@ -70,9 +91,9 @@ class TrainManiFlowRoboTwinWorkspace:
         random.seed(seed)
 
         # configure model
-        self.model: ManiFlowTransformerPointcloudPolicy = hydra.utils.instantiate(cfg.policy)
+        self.model: ManiFlowTransformerImagePolicy = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: ManiFlowTransformerPointcloudPolicy = None
+        self.ema_model: ManiFlowTransformerImagePolicy = None
         if cfg.training.use_ema:
             try:
                 self.ema_model = copy.deepcopy(self.model)
@@ -392,6 +413,7 @@ class TrainManiFlowRoboTwinWorkspace:
             # log of last step is combined with validation and rollout
             if WANDB:
                 wandb_run.log(step_log, step=self.global_step)
+            _csv_log_epoch(self.output_dir, self.epoch, self.global_step, step_log)
             self.global_step += 1
             self.epoch += 1
             del step_log
