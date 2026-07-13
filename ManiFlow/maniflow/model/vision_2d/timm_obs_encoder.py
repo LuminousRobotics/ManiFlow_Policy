@@ -299,7 +299,14 @@ class TimmObsEncoder(ModuleAttrMixin):
                 img = F.interpolate(img, size=(target_H, target_W), mode='bilinear', align_corners=False)
             
             assert img.shape[1:] == self.key_shape_map[key]
-            img = self.key_transform_map[key](img).to(self.device)
+            # Image augmentation (RandomCrop/Rotation/ColorJitter) has no learnable
+            # params, so its intermediates never need to be retained for backward.
+            # Running it under no_grad frees several GB of activations (ColorJitter's
+            # hsv2rgb einsum alone is multi-GB across two trunks x B*T images) and
+            # avoids OOM. The trainable encoder below still backprops normally from
+            # the augmented pixels.
+            with torch.no_grad():
+                img = self.key_transform_map[key](img).to(self.device)
             raw_feature = self.key_model_map[key](img).to(self.device)
             feature = self.aggregate_feature(raw_feature)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T
