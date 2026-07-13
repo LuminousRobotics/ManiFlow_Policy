@@ -114,7 +114,9 @@ dataloader:
   shuffle: True
   pin_memory: True
   persistent_workers: True
-  # drop_last: True
+  drop_last: True   # consistency loss (v_ct = (pred-x)/(1-t), 75/25 flow/consistency
+                    # split) is ill-defined on an undersized remainder batch -> NaN.
+                    # Full batches only. (upstream shipped this commented-out.)
 
 val_dataloader:
   batch_size: 128 # 128
@@ -122,7 +124,8 @@ val_dataloader:
   shuffle: False
   pin_memory: True
   persistent_workers: False
-  # drop_last: True
+  drop_last: True   # same reason: a small trailing val batch -> NaN val_loss that
+                    # torch.mean propagates to the whole epoch. Drop it.
 
 optimizer:
   _target_: torch.optim.AdamW
