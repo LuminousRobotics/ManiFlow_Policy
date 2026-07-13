@@ -182,6 +182,22 @@ class TrainManiFlowRoboTwinWorkspace:
         cprint(f"Number of training episodes: {dataset.train_episodes_num}", 'red')
         cprint(f"Number of validation episodes: {dataset.val_episodes_num}", 'red')
 
+        # Warn early if validation will produce no batches: with drop_last=True a val
+        # set smaller than one batch yields 0 val batches -> no val_loss -> best-ckpt
+        # selection falls back to train_loss. Common on tiny smoke datasets; on a real
+        # dataset this should never trigger. Surfaced here so it isn't a surprise mid-run.
+        try:
+            _n_val_batches = len(val_dataloader)
+            if _n_val_batches == 0:
+                cprint(f"[WARN] validation set is too small for one batch "
+                       f"(batch_size={cfg.val_dataloader.batch_size}, drop_last="
+                       f"{cfg.val_dataloader.get('drop_last', False)}): 0 val batches — "
+                       f"val_loss will be unavailable and best-checkpoint selection will "
+                       f"fall back to train_loss. Increase val_ratio, add episodes, or "
+                       f"lower val_dataloader.batch_size.", 'yellow')
+        except TypeError:
+            pass  # some samplers have no len(); ignore
+
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -445,6 +461,21 @@ class TrainManiFlowRoboTwinWorkspace:
                 #     save_path = f'checkpoints/{self.cfg.robotwin_task.name}_w_rgb/{self.epoch + 1}.ckpt'
 
                 # self.save_checkpoint(save_path)
+                # The topk manager monitors `val_loss`; on epochs where validation
+                # did not run (val_every) OR produced no batches (val set too small to
+                # fill one batch under drop_last — e.g. a tiny dataset with val_ratio
+                # rounding to <1 usable batch), val_loss is absent and get_ckpt_path
+                # KeyErrors. Fall back to train_loss so a checkpoint still saves and is
+                # rankable, instead of silently skipping it (which would leave only the
+                # final latest.ckpt to publish). Real runs with a proper val set are
+                # unaffected — val_loss is present and used as before.
+                monitor_key = cfg.checkpoint.topk.monitor_key
+                if monitor_key not in metric_dict:
+                    fallback = metric_dict.get('train_loss')
+                    if fallback is not None:
+                        cprint(f"[topk] no {monitor_key} this epoch — ranking checkpoint "
+                               f"by train_loss={fallback:.6f} instead", 'yellow')
+                        metric_dict[monitor_key] = fallback
                 try:
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
                 except Exception as e:
