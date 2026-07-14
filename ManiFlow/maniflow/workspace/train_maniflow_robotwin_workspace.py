@@ -68,8 +68,10 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
     fields = ['epoch', 'global_step',
               'train_loss', 'val_loss', 'bc_loss',
               'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
+              'loss_endpoint',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
-              'train_action_mse_error', 'lr', 'grad_norm', 'param_norm']
+              'train_action_mse_error', 'val_action_mse_error',
+              'lr', 'grad_norm', 'param_norm']
     row = {'epoch': epoch, 'global_step': global_step}
     for key in fields[2:]:
         value = step_log.get(key)
@@ -250,10 +252,16 @@ class TrainManiFlowRoboTwinWorkspace:
                 }
             )
 
-        # configure checkpoint
+        # configure checkpoint. Auto-derive format_str from monitor_key so the checkpoint
+        # FILENAME always embeds the metric actually being selected on — keeps the workspace,
+        # get_checkpoint_path, and publish.py's filename parser consistent even when
+        # monitor_key is overridden (e.g. A0 baseline selects on val_loss). See v2_plan OQ2.
+        topk_cfg = dict(cfg.checkpoint.topk)
+        _mk = topk_cfg.get('monitor_key', 'val_loss')
+        topk_cfg['format_str'] = 'epoch={epoch:04d}-' + _mk + '={' + _mk + ':.6f}.ckpt'
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
+            **topk_cfg
         )
 
         # device transfer
@@ -265,7 +273,8 @@ class TrainManiFlowRoboTwinWorkspace:
 
         # save batch for sampling
         train_sampling_batch = None
-        
+        val_sampling_batch = None   # first val batch, reused for val-split action-error (Lumi v2)
+
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         for local_epoch_idx in range(cfg.training.num_epochs):
@@ -393,6 +402,8 @@ class TrainManiFlowRoboTwinWorkspace:
                             leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
                             batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                            if val_sampling_batch is None:
+                                val_sampling_batch = batch
 
                             # Forward pass
                             loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
@@ -414,7 +425,18 @@ class TrainManiFlowRoboTwinWorkspace:
                             step_log['val_loss_flow'] = float(np.mean(val_flow))
                         if val_ct:
                             step_log['val_loss_ct'] = float(np.mean(val_ct))
-            
+
+                    # Lumi v2: VAL-SPLIT ACTION ERROR — run the deployed sampler on a held-out
+                    # val batch and MSE the predicted action chunk vs GT. This is the
+                    # deployment-predictive checkpoint-selection signal (val velocity-loss is
+                    # ~uncorrelated with task success; see docs/v2_plan.md OQ2). Selection can
+                    # monitor `val_action_mse_error` instead of `val_loss`.
+                    if val_sampling_batch is not None:
+                        vb = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                        vres = policy.predict_action(vb['obs'])
+                        v_mse = torch.nn.functional.mse_loss(vres['action_pred'], vb['action'])
+                        step_log['val_action_mse_error'] = v_mse.item()
+
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
                 with torch.no_grad():
@@ -667,13 +689,16 @@ class TrainManiFlowRoboTwinWorkspace:
     def get_checkpoint_path(self, tag='latest', monitor_key='test_mean_score'):
         if tag=='latest':
             return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
-        elif tag=='best': 
+        elif tag=='best':
             # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
             # find the best checkpoint
             checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
             all_checkpoints = os.listdir(checkpoint_dir)
             best_ckpt = None
-            best_score = -1e10 if 'loss' not in monitor_key else float('inf')
+            # lower-is-better for loss / error / mse metrics (e.g. val_loss,
+            # val_action_mse_error); higher-is-better for score metrics.
+            minimize = any(s in monitor_key for s in ('loss', 'error', 'mse'))
+            best_score = float('inf') if minimize else -1e10
             for ckpt in all_checkpoints:
                 if 'latest' in ckpt:
                     continue
@@ -681,9 +706,9 @@ class TrainManiFlowRoboTwinWorkspace:
                     # Extract score for the specified monitor_key
                     score_str = ckpt.split(f'{monitor_key}=')[1].split('.ckpt')[0]
                     score = float(score_str)
-                    
+
                     # Update best score based on whether we're minimizing or maximizing
-                    if 'loss' in monitor_key:
+                    if minimize:
                         if score < best_score:
                             best_ckpt = ckpt
                             best_score = score

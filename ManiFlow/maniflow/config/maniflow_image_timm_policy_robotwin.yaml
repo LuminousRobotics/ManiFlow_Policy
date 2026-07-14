@@ -33,10 +33,17 @@ policy:
   consistency_batch_ratio: 0.25
 
   sample_t_mode_flow: "beta" # choose between beta or lognorm, both are performing well
-  sample_t_mode_consistency: "discrete" 
+  sample_t_mode_consistency: "discrete"
   sample_dt_mode_consistency: "uniform"
   sample_target_t_mode: "relative" # "absolute", "relative"
   denoise_timesteps: 10
+
+  # --- Lumi v2 precision losses (defaults OFF => stock ManiFlow). Set via training_config.yaml. ---
+  endpoint_loss_weight: 0.0        # lambda for x1-reconstruction aux loss (flow branch only)
+  endpoint_loss_type: "mse"        # "mse" | "l1"
+  endpoint_t_clip: 0.98            # clip t before 1/(1-t) in x1_hat reconstruction
+  action_step_weights: null        # optional per-chunk-step weights (len==horizon), up-weight contact steps
+  action_dim_weights: null         # optional per-action-dim weights (len==action_dim), up-weight rotvec/yaw
 
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128
@@ -166,13 +173,13 @@ logging:
 checkpoint:
   save_ckpt: True # if True, save checkpoint every checkpoint_every
   topk:
-    monitor_key: val_loss # test_mean_score, val_loss
-    # mode: max
-    # k: 0
-    # format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+    # Lumi v2: select on VAL-SPLIT ACTION ERROR (deployment-predictive), not val_loss
+    # (velocity val-loss is ~uncorrelated with task success; see docs/v2_plan.md OQ2).
+    # Override to val_loss for the A0 baseline to log the correlation on our data.
+    monitor_key: val_action_mse_error # val_action_mse_error, val_loss, test_mean_score
     mode: min
     k: 1
-    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+    format_str: 'epoch={epoch:04d}-val_action_mse_error={val_action_mse_error:.6f}.ckpt'
   save_last_ckpt: True # this only saves when save_ckpt is True
   save_last_snapshot: False
 

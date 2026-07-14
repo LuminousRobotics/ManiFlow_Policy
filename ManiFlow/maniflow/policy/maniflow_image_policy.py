@@ -35,10 +35,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             flow_batch_ratio=0.75,
             consistency_batch_ratio=0.25,
             denoise_timesteps=10,
-            sample_t_mode_flow="beta", 
+            sample_t_mode_flow="beta",
             sample_t_mode_consistency="discrete",
-            sample_dt_mode_consistency="uniform", 
+            sample_dt_mode_consistency="uniform",
             sample_target_t_mode="relative", # relative, absolute
+            # --- Lumi v2 precision losses (all default OFF => stock ManiFlow behaviour) ---
+            endpoint_loss_weight=0.0,          # lambda for the x1-reconstruction aux loss (flow branch only)
+            endpoint_loss_type="mse",          # "mse" or "l1"
+            endpoint_t_clip=0.98,              # clip t before dividing by (1-t) in x1_hat reconstruction
+            action_step_weights=None,          # optional per-chunk-step weight list, len==horizon (up-weight contact steps)
+            action_dim_weights=None,           # optional per-action-dim weight list, len==action_dim (up-weight rotvec/yaw)
             **kwargs):
         super().__init__()
 
@@ -106,7 +112,25 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.sample_dt_mode_consistency = sample_dt_mode_consistency
         self.sample_target_t_mode = sample_target_t_mode
         assert self.sample_target_t_mode in ["absolute", "relative"], "sample_target_t_mode must be either 'absolute' or 'relative'"
-        
+
+        # --- Lumi v2 precision-loss config ---
+        self.endpoint_loss_weight = float(endpoint_loss_weight)
+        self.endpoint_loss_type = endpoint_loss_type
+        self.endpoint_t_clip = float(endpoint_t_clip)
+        # per-step / per-dim weight vectors as buffers so they move with .to(device); None => uniform
+        if action_step_weights is not None:
+            w = torch.as_tensor(list(action_step_weights), dtype=torch.float32).view(1, -1, 1)
+            assert w.shape[1] == horizon, f"action_step_weights len {w.shape[1]} != horizon {horizon}"
+            self.register_buffer("action_step_weights", w)
+        else:
+            self.action_step_weights = None
+        if action_dim_weights is not None:
+            w = torch.as_tensor(list(action_dim_weights), dtype=torch.float32).view(1, 1, -1)
+            assert w.shape[2] == action_dim, f"action_dim_weights len {w.shape[2]} != action_dim {action_dim}"
+            self.register_buffer("action_dim_weights", w)
+        else:
+            self.action_dim_weights = None
+
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
@@ -119,6 +143,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - sample_t_mode_consistency: {self.sample_t_mode_consistency}", "yellow")
         cprint(f"  - sample_dt_mode_consistency: {self.sample_dt_mode_consistency}", "yellow")
         cprint(f"  - sample_target_t_mode: {self.sample_target_t_mode}", "yellow")
+        cprint(f"  - endpoint_loss_weight: {self.endpoint_loss_weight} ({self.endpoint_loss_type})", "yellow")
+        cprint(f"  - action_step_weights: {'set' if self.action_step_weights is not None else 'uniform'}", "yellow")
+        cprint(f"  - action_dim_weights: {'set' if self.action_dim_weights is not None else 'uniform'}", "yellow")
 
         print_params(self)
         
@@ -442,6 +469,23 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         return traj
 
+    def _weighted_step_mean(self, per_elem):
+        """Reduce a (B, T, Da) per-element loss to (B,) applying optional per-chunk-step and
+        per-action-dim weights. When no weights are set this equals reduce(.,'b ... -> b','mean')
+        i.e. the stock ManiFlow behaviour."""
+        w = None
+        if self.action_step_weights is not None:
+            w = self.action_step_weights.to(per_elem.dtype)                       # (1,T,1)
+        if self.action_dim_weights is not None:
+            dw = self.action_dim_weights.to(per_elem.dtype)                       # (1,1,Da)
+            w = dw if w is None else (w * dw)
+        if w is None:
+            return reduce(per_elem, 'b ... -> b (...)', 'mean').mean(dim=1)
+        # weighted mean over (T, Da): sum(w*loss) / sum(w)
+        num = (per_elem * w).sum(dim=(1, 2))
+        den = w.expand_as(per_elem).sum(dim=(1, 2))
+        return num / den
+
     def compute_loss(self, batch, ema_model=None, **kwargs):
         # normalize input
         nobs = self.normalizer.normalize(batch['obs'])
@@ -504,28 +548,51 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         """Compute losses"""
         loss = 0.
 
-        # compute flow loss 
+        # compute flow loss (per-element MSE, then optional step/dim-weighted reduction)
         v_flow_target = flow_target_dict['v_target']
-        loss_flow = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
-        loss_flow = reduce(loss_flow, 'b ... -> b (...)', 'mean')
-        loss += loss_flow.mean()
-        loss_flow = loss_flow.mean().item()
+        loss_flow_elem = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
+        loss_flow_b = self._weighted_step_mean(loss_flow_elem)                    # (B,)
+        loss += loss_flow_b.mean()
+        loss_flow = loss_flow_b.mean().item()
 
-        # compute consistency training loss
+        # compute consistency training loss (same weighting; CT branch otherwise untouched)
         v_ct_target = consistency_target_dict['v_target']
-        loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
-        loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
-        loss += loss_ct.mean()
-        loss_ct = loss_ct.mean().item()  
+        loss_ct_elem = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
+        loss_ct_b = self._weighted_step_mean(loss_ct_elem)                        # (B,)
+        loss += loss_ct_b.mean()
+        loss_ct = loss_ct_b.mean().item()
+
+        # --- Lumi v2: endpoint (x1-reconstruction) aux loss, FLOW BRANCH ONLY ---
+        # For the linear interpolant x_t = (1-t)*x0 + t*x1 with v = x1 - x0, the predicted
+        # clean endpoint is x1_hat = x_t + (1-t)*v_pred. MSE-ing x1_hat vs the true action
+        # chunk is an exact reparameterization of the velocity loss that reweights samples by
+        # (1-t)^2 (up-weights high-noise/low-t samples, which few-step inference exercises).
+        # CT branch is intentionally excluded (NaN history; it already reconstructs x1 via the
+        # EMA teacher). Default weight 0 => stock behaviour.
+        loss_endpoint = 0.0
+        if self.endpoint_loss_weight > 0.0:
+            t_flow = flow_target_dict['t']                                        # (B,1,1)
+            x_t_flow = flow_target_dict['x_t']
+            x1_true = nactions[:flow_batchsize]
+            one_minus_t = (1.0 - t_flow).clamp(min=1.0 - self.endpoint_t_clip)    # avoid /0 at t->1
+            x1_hat = x_t_flow + one_minus_t * v_flow_pred
+            if self.endpoint_loss_type == "l1":
+                ep_elem = F.l1_loss(x1_hat, x1_true, reduction='none')
+            else:
+                ep_elem = F.mse_loss(x1_hat, x1_true, reduction='none')
+            ep_b = self._weighted_step_mean(ep_elem)                             # (B,)
+            loss = loss + self.endpoint_loss_weight * ep_b.mean()
+            loss_endpoint = ep_b.mean().item()
 
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
+                'loss_endpoint': loss_endpoint,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
         }
-        
+
 
         return loss, loss_dict
