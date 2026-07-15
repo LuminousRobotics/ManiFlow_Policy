@@ -1,5 +1,6 @@
 import copy
 
+import numpy as np
 import timm
 import math
 import torch
@@ -69,6 +70,11 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature_aggregation: str='spatial_embedding',
             downsample_ratio: int=32,
             position_encording: str='learnable',
+            # v3 dense-token mode: emit (B, L, feature_dim) conditioning TOKENS instead of
+            # one flattened (B, K*feature_dim) vector. RGB trunks -> H*W spatial tokens/frame
+            # (no pooling); each low-dim key -> 1 projected token/frame. This un-starves
+            # DiT-X cross-attention (v1/v2 collapsed all obs into a single token).
+            token_output: bool=False,
 
         ):
         """
@@ -76,7 +82,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         Assumes low_dim input: B,T,D
         """
         super().__init__()
-        
+
         rgb_keys = list()
         low_dim_keys = list()
         key_model_map = nn.ModuleDict()
@@ -84,6 +90,10 @@ class TimmObsEncoder(ModuleAttrMixin):
         key_shape_map = dict()
 
         assert global_pool == ''
+        self.token_output = token_output
+        # in token mode force the dense (no-aggregation) resnet path
+        if token_output and not model_name.startswith('vit'):
+            feature_aggregation = None
 
         if model_name == "r3m":
             from r3m import load_r3m
@@ -192,6 +202,19 @@ class TimmObsEncoder(ModuleAttrMixin):
         self.low_dim_keys = low_dim_keys
         self.key_shape_map = key_shape_map
         self.feature_aggregation = feature_aggregation
+
+        # v3 token mode: (a) explicit ImageNet normalization (a timm-pretrained trunk
+        # expects it; the base encoder's `imagenet_norm` flag is otherwise a no-op here),
+        # (b) a per-low-dim-key Linear -> feature_dim so every modality yields tokens of
+        # the same width for concatenation on the token axis.
+        self.token_imagenet_norm = bool(token_output and imagenet_norm)
+        if self.token_imagenet_norm:
+            self.register_buffer('_in_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer('_in_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        if token_output:
+            self.lowdim_proj = nn.ModuleDict({
+                key: nn.Linear(int(np.prod(key_shape_map[key])), feature_dim)
+                for key in low_dim_keys})
 
         if model_name.startswith('vit'):
             # assert self.feature_aggregation is None # vit uses the CLS token
@@ -307,10 +330,17 @@ class TimmObsEncoder(ModuleAttrMixin):
             # the augmented pixels.
             with torch.no_grad():
                 img = self.key_transform_map[key](img).to(self.device)
+            if self.token_imagenet_norm:
+                img = (img - self._in_mean) / self._in_std
             raw_feature = self.key_model_map[key](img).to(self.device)
             feature = self.aggregate_feature(raw_feature)
-            assert len(feature.shape) == 2 and feature.shape[0] == B * T
-            features.append(feature.reshape(B, -1))
+            if self.token_output:
+                # feature: (B*T, H*W, D) dense tokens -> (B, T*H*W, D)
+                assert len(feature.shape) == 3 and feature.shape[0] == B * T
+                features.append(feature.reshape(B, T * feature.shape[1], feature.shape[2]))
+            else:
+                assert len(feature.shape) == 2 and feature.shape[0] == B * T
+                features.append(feature.reshape(B, -1))
 
         # process lowdim input
         for key in self.low_dim_keys:
@@ -318,13 +348,20 @@ class TimmObsEncoder(ModuleAttrMixin):
             B, T = data.shape[:2]
             assert B == batch_size
             assert data.shape[2:] == self.key_shape_map[key]
-            features.append(data.reshape(B, -1))
-        
-        # concatenate all features
-        result = torch.cat(features, dim=-1)
+            if self.token_output:
+                # (B,T,*) -> one projected token per frame: (B, T, D)
+                tok = self.lowdim_proj[key](data.reshape(B, T, -1))
+                features.append(tok)
+            else:
+                features.append(data.reshape(B, -1))
+
+        # token mode: concat on the TOKEN axis -> (B, L, D); the policy passes this
+        # straight to DiT-X cross-attention (its reshape(B,-1,D) is then a no-op).
+        # legacy mode: concat flattened features -> (B, K*D).
+        result = torch.cat(features, dim=1 if self.token_output else -1)
 
         return result
-    
+
 
     @torch.no_grad()
     def output_shape(self):
@@ -333,14 +370,16 @@ class TimmObsEncoder(ModuleAttrMixin):
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
             this_obs = torch.zeros(
-                (1, attr['horizon']) + shape, 
+                (1, attr['horizon']) + shape,
                 dtype=self.dtype,
                 device=self.device)
             example_obs_dict[key] = this_obs
         example_output = self.forward(example_obs_dict)
-        assert len(example_output.shape) == 2
-        assert example_output.shape[0] == 1
-        
+        if self.token_output:
+            assert len(example_output.shape) == 3 and example_output.shape[0] == 1
+        else:
+            assert len(example_output.shape) == 2
+            assert example_output.shape[0] == 1
         return example_output.shape
 
 

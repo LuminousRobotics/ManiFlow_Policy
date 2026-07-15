@@ -1,0 +1,56 @@
+# Lumi place-policy v3 task config (ConversionVersion v6, ANCHORED actions).
+# COPY'd into the ManiFlow clone as maniflow/config/robotwin_task/lumi_place_v3.yaml
+# Selected at launch via: robotwin_task=lumi_place_v3
+#
+# v3 vs v1/v2:
+#   - obs = head_cam + depth_cam + prev_action(6) + task(1); joints/imu/suction/module_width dropped.
+#   - action = ANCHORED-to-chunk-start camera-frame deltas (dataset builds them per sample
+#     from stored absolute poses; last row = chunk endpoint = the goal for a full descent).
+#   - goal_cam (6) rides ALONGSIDE action for the aux goal head (never an obs / ONNX input).
+#   - depth stored uint16 mm; depth_input selects tiled (default) or H3DP-lite 3-band masks.
+
+name: lumi_place_v3
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    depth_cam:
+      shape: [3, 224, 224]     # u16 mm -> 3ch (tiled) or 3 depth bands (layered)
+      type: rgb
+      horizon: ${n_obs_steps}
+    prev_action:
+      shape: [6]               # previous-step executed camera-frame delta (row0 = zeros)
+      type: low_dim
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]               # [neighbor_present]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [6]                 # anchored-to-chunk-start camera-frame deltas [dx,dy,dz,rotvec(3)]
+    horizon: ${horizon}
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???               # override at launch: robotwin_task.dataset.zarr_path=...
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  depth_input: tiled           # "tiled" | "layered" (H3DP-lite); B1 flips to layered
+  # spec 4.4 dataloader-side augmentation — zarr stays clean; overridable from
+  # training_config via robotwin_task.dataset.augmentation.*
+  augmentation:
+    enable: true
+    depth_noise_sigma0: 0.005
+    depth_px_dropout: 0.02
+    depth_flying_px: 0.005
+    depth_episode_dropout: 0.4
+    prev_action_noise_mm: 0.5
+    prev_action_noise_deg: 0.05
+    latency_shift_prob: 0.5

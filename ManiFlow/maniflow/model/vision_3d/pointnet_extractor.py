@@ -4,7 +4,9 @@ import torch.nn.functional as F
 import copy
 
 from typing import Optional, Dict, Tuple, Union, List, Type
-import maniflow.model.vision_3d.point_process as point_process
+# NOTE: point_process imports pytorch3d.ops at module level, which is NOT in the image
+# container's requirements. Import it LAZILY inside the branch that needs it (FPS
+# downsampling) so PointNetEncoderXYZ can be imported for the RGB+PC image policy (B2).
 from termcolor import cprint
 
 def create_mlp(
@@ -237,6 +239,7 @@ class DP3Encoder(nn.Module):
         
         self.downsample_points = downsample_points
         if self.downsample_points:
+            import maniflow.model.vision_3d.point_process as point_process  # lazy (pytorch3d)
             self.point_preprocess = point_process.fps_torch
             self.num_points = pointcloud_encoder_cfg.num_points # 4096
         else:

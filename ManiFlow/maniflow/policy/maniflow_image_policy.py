@@ -1,5 +1,7 @@
 from typing import Dict, Tuple
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from einops import reduce
 from termcolor import cprint
@@ -45,6 +47,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             endpoint_t_clip=0.98,              # clip t before dividing by (1-t) in x1_hat reconstruction
             action_step_weights=None,          # optional per-chunk-step weight list, len==horizon (up-weight contact steps)
             action_dim_weights=None,           # optional per-action-dim weight list, len==action_dim (up-weight rotvec/yaw)
+            # --- Lumi v3 auxiliary goal head (default OFF => no goal head built) ---
+            goal_loss_weight=0.0,              # lambda for the goal-in-camera-frame aux head (Huber); 0 => off
+            goal_loss_type="huber",            # "huber" | "mse"
             **kwargs):
         super().__init__()
 
@@ -91,7 +96,21 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         
         self.obs_encoder = obs_encoder
         self.model = model
-        
+
+        # v3 dense tokens: DiTX slices the positional-embedding table to the actual token
+        # count, so a token count ABOVE the table capacity would be silently truncated.
+        # Fail loud instead. (obs_feature_dim carries the token width; the token COUNT
+        # is output_shape()[1] when the encoder is in token mode.)
+        enc_out = obs_encoder.output_shape()
+        if len(enc_out) == 3:
+            n_tokens = int(enc_out[1])
+            cap = int(visual_cond_len) * int(n_obs_steps)
+            assert n_tokens <= cap, (
+                f"encoder emits {n_tokens} conditioning tokens but visual_cond_len*"
+                f"n_obs_steps={cap}; raise visual_cond_len (pos-embed table @ ditx.py) "
+                f"to >= {int(np.ceil(n_tokens / n_obs_steps))}")
+            cprint(f"[ManiFlow] dense-token conditioning: {n_tokens} tokens (cap {cap})", "green")
+
         self.normalizer = LinearNormalizer()
         self.horizon = horizon
         self.obs_feature_dim = obs_feature_dim
@@ -131,6 +150,17 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         else:
             self.action_dim_weights = None
 
+        # --- Lumi v3 auxiliary goal head (regularizes the encoder toward localizing the
+        # goal; TRAINING ONLY — never used by predict_action / ONNX). Predicts the goal
+        # pose in the obs-time camera frame (6-D: pos + rotvec) from mean-pooled tokens. ---
+        self.goal_loss_weight = float(goal_loss_weight)
+        self.goal_loss_type = goal_loss_type
+        if self.goal_loss_weight > 0.0:
+            self.goal_head = nn.Sequential(
+                nn.Linear(obs_feature_dim, 256), nn.GELU(), nn.Linear(256, 6))
+        else:
+            self.goal_head = None
+
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
@@ -146,6 +176,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - endpoint_loss_weight: {self.endpoint_loss_weight} ({self.endpoint_loss_type})", "yellow")
         cprint(f"  - action_step_weights: {'set' if self.action_step_weights is not None else 'uniform'}", "yellow")
         cprint(f"  - action_dim_weights: {'set' if self.action_dim_weights is not None else 'uniform'}", "yellow")
+        cprint(f"  - goal_loss_weight: {self.goal_loss_weight} ({self.goal_loss_type})", "yellow")
 
         print_params(self)
         
@@ -584,11 +615,26 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             loss = loss + self.endpoint_loss_weight * ep_b.mean()
             loss_endpoint = ep_b.mean().item()
 
+        # --- Lumi v3: auxiliary goal head (training-only encoder regularizer) ---
+        # Predict the normalized goal-in-camera-frame (6-D) from mean-pooled conditioning
+        # tokens and match batch['goal_cam']. Encourages the encoder to localize the goal.
+        loss_goal = 0.0
+        if self.goal_head is not None and 'goal_cam' in batch:
+            goal_norm = self.normalizer['goal_cam'].normalize(batch['goal_cam']).to(self.device)
+            goal_pred = self.goal_head(vis_cond.mean(dim=1))                      # (B,6)
+            if self.goal_loss_type == "mse":
+                gl = F.mse_loss(goal_pred, goal_norm)
+            else:
+                gl = F.smooth_l1_loss(goal_pred, goal_norm)
+            loss = loss + self.goal_loss_weight * gl
+            loss_goal = gl.item()
+
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
                 'loss_endpoint': loss_endpoint,
+                'loss_goal': loss_goal,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),

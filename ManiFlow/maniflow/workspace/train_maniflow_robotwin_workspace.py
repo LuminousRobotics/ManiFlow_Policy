@@ -68,9 +68,10 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
     fields = ['epoch', 'global_step',
               'train_loss', 'val_loss', 'bc_loss',
               'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
-              'loss_endpoint',
+              'loss_endpoint', 'loss_goal',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',
+              'val_goal_pos_mm', 'val_goal_rot_deg',
               'lr', 'grad_norm', 'param_norm']
     row = {'epoch': epoch, 'global_step': global_step}
     for key in fields[2:]:
@@ -427,15 +428,36 @@ class TrainManiFlowRoboTwinWorkspace:
                             step_log['val_loss_ct'] = float(np.mean(val_ct))
 
                     # Lumi v2: VAL-SPLIT ACTION ERROR — run the deployed sampler on a held-out
-                    # val batch and MSE the predicted action chunk vs GT. This is the
-                    # deployment-predictive checkpoint-selection signal (val velocity-loss is
-                    # ~uncorrelated with task success; see docs/v2_plan.md OQ2). Selection can
-                    # monitor `val_action_mse_error` instead of `val_loss`.
+                    # val batch and MSE the predicted action chunk vs GT. (kept for continuity.)
                     if val_sampling_batch is not None:
                         vb = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         vres = policy.predict_action(vb['obs'])
                         v_mse = torch.nn.functional.mse_loss(vres['action_pred'], vb['action'])
                         step_log['val_action_mse_error'] = v_mse.item()
+
+                    # Lumi v3: VAL-SPLIT GOAL ERROR over the FULL val split — the
+                    # deployment-meaningful landing metric and the checkpoint-selection signal.
+                    # Anchored actions => the LAST predicted chunk row is the endpoint; compare
+                    # it to the true goal-in-camera-frame label (batch['goal_cam'], 6-D). Own
+                    # loader with drop_last=False (predict_action has no consistency-NaN risk, so
+                    # partial batches are safe — avoids the val drop_last starvation trap).
+                    if 'goal_cam' in (val_sampling_batch or {}):
+                        goal_pos_errs = []; goal_rot_errs = []
+                        val_goal_loader = torch.utils.data.DataLoader(
+                            val_dataset, batch_size=cfg.val_dataloader.batch_size,
+                            num_workers=0, shuffle=False, drop_last=False)
+                        for gb in val_goal_loader:
+                            gb = dict_apply(gb, lambda x: x.to(device, non_blocking=True))
+                            gpred = policy.predict_action(gb['obs'])['action_pred'][:, -1]  # (B,6) endpoint
+                            gt = gb['goal_cam']                                             # (B,6)
+                            goal_pos_errs.append(
+                                torch.linalg.norm(gpred[:, :3] - gt[:, :3], dim=1) * 1000.0)  # mm
+                            # rotvec geodesic: angle of (R_pred R_gt^T) ~ ||logmap||; small-angle
+                            # difference of rotvecs is an accurate proxy at these magnitudes.
+                            goal_rot_errs.append(
+                                torch.rad2deg(torch.linalg.norm(gpred[:, 3:] - gt[:, 3:], dim=1)))  # deg
+                        step_log['val_goal_pos_mm'] = torch.cat(goal_pos_errs).mean().item()
+                        step_log['val_goal_rot_deg'] = torch.cat(goal_rot_errs).mean().item()
 
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:
@@ -695,9 +717,10 @@ class TrainManiFlowRoboTwinWorkspace:
             checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
             all_checkpoints = os.listdir(checkpoint_dir)
             best_ckpt = None
-            # lower-is-better for loss / error / mse metrics (e.g. val_loss,
-            # val_action_mse_error); higher-is-better for score metrics.
-            minimize = any(s in monitor_key for s in ('loss', 'error', 'mse'))
+            # lower-is-better for loss / error / mse / distance metrics (e.g. val_loss,
+            # val_action_mse_error, val_goal_pos_mm, val_goal_rot_deg); higher-is-better
+            # for score metrics.
+            minimize = any(s in monitor_key for s in ('loss', 'error', 'mse', '_mm', '_deg'))
             best_score = float('inf') if minimize else -1e10
             for ckpt in all_checkpoints:
                 if 'latest' in ckpt:
