@@ -147,9 +147,33 @@ class TimmObsEncoder(ModuleAttrMixin):
                 root_module=model,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(
-                    num_groups=(x.num_features // 16) if (x.num_features % 16 == 0) else (x.num_features // 8), 
+                    num_groups=(x.num_features // 16) if (x.num_features % 16 == 0) else (x.num_features // 8),
                     num_channels=x.num_features)
             )
+
+        # v3 token mode with a PRETRAINED trunk: freeze BatchNorm (FrozenBatchNorm2d).
+        # Two hazards otherwise: (a) EMAModel deepcopies BN running stats once and then
+        # only averages parameters -> the EMA policy runs live-averaged weights against
+        # stale BN stats; (b) small-batch, heavily-augmented two-trunk batches drift the
+        # running stats away from the ImageNet statistics the pretrained weights expect.
+        # FrozenBatchNorm2d is immune to .train() flips — the standard finetune recipe.
+        if token_output and pretrained:
+            from torchvision.ops.misc import FrozenBatchNorm2d
+
+            def _to_frozen_bn(bn):
+                fbn = FrozenBatchNorm2d(bn.num_features, eps=bn.eps)
+                with torch.no_grad():
+                    fbn.weight.copy_(bn.weight)
+                    fbn.bias.copy_(bn.bias)
+                    fbn.running_mean.copy_(bn.running_mean)
+                    fbn.running_var.copy_(bn.running_var)
+                return fbn
+
+            model = replace_submodules(
+                root_module=model,
+                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                func=_to_frozen_bn)
+            cprint("[TimmObsEncoder] token mode: BatchNorm frozen (FrozenBatchNorm2d)", "green")
         
         image_shape = None
         obs_shape_meta = shape_meta['obs']

@@ -171,11 +171,18 @@ class LumiPlaceImageDataset(BaseDataset):
         return val_set
 
     def _all_anchored_actions(self):
-        """Anchored chunks for EVERY sampler window — used to fit the action normalizer
-        over the exact tensors training sees (not the raw absolute poses)."""
+        """Anchored chunks for EVERY train-sampler window — used to fit the action
+        normalizer over the exact tensors training sees (not the raw absolute poses).
+        Uses a pose-only sampler so image arrays are never sliced here (fitting over
+        ~2-3k windows would otherwise churn GBs of head_camera/depth copies)."""
+        pose_sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer, sequence_length=self.horizon,
+            pad_before=self.pad_before, pad_after=self.pad_after,
+            keys=['tcp_pos_w', 'tcp_quat_w', 'cam_quat_cv'],
+            episode_mask=self.train_mask)
         chunks = []
-        for idx in range(len(self.sampler)):
-            s = self.sampler.sample_sequence(idx)
+        for idx in range(len(pose_sampler)):
+            s = pose_sampler.sample_sequence(idx)
             anchor = min(self.pad_before, len(s['tcp_pos_w']) - 1)
             chunks.append(build_anchored_chunk(
                 s['tcp_pos_w'], s['tcp_quat_w'], s['cam_quat_cv'], anchor))
