@@ -216,29 +216,29 @@ class TimmObsEncoder(ModuleAttrMixin):
             if type == 'rgb':
                 assert image_shape is None or image_shape == shape[1:]
                 image_shape = shape[1:]
+        # v3 token mode: a "depth" rgb key (name contains 'depth') is a metric depth map
+        # banded into N channels, NOT a photometric image. Random geometric aug (crop/rotation)
+        # done per-key with independent RNG would DE-REGISTER it from the paired head_cam (same
+        # physical camera), and ColorJitter / ImageNet norm are meaningless on depth. So depth
+        # keys get ONLY a deterministic crop+resize matching head_cam's static crop size (depth's
+        # own axial/dropout aug happens upstream in the dataset). depth_transform is built HERE,
+        # inside the same block, BEFORE `transforms` is reassigned below (else the re-test would
+        # fail once transforms[0] becomes an nn.Module and depth would wrongly fall back to the
+        # RGB stack — which uses antialias=True and rejects >3 channels).
+        # antialias=False: torchvision's AA path only accepts 1/3 channels ("permitted channel
+        # values are [1,3], but found N"); AA is meaningless on discrete band-masks anyway.
+        depth_transform = None
         if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
             assert transforms[0].type == 'RandomCrop'
             ratio = transforms[0].ratio
+            depth_transform = torch.nn.Sequential(
+                torchvision.transforms.CenterCrop(size=int(image_shape[0] * ratio)),
+                torchvision.transforms.Resize(size=image_shape[0], antialias=False))
             transforms = [
                 torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
                 torchvision.transforms.Resize(size=image_shape[0], antialias=True)
             ] + transforms[1:]
         transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
-
-        # v3 token mode: a "depth" rgb key (name contains 'depth') is a metric depth map
-        # tiled/banded into 3 channels, NOT a photometric image. Random geometric aug
-        # (crop/rotation) is done per-key with independent RNG draws, which would DE-REGISTER
-        # it from the paired head_cam (same physical camera) — and ColorJitter / ImageNet
-        # normalization are meaningless on depth. So for depth keys in token mode: use only
-        # the deterministic geometric transform (crop+resize, matching head_cam's static part)
-        # and skip photometric aug + ImageNet norm. Depth's OWN augmentation (axial noise,
-        # dropout, flying px) already happens upstream in the dataset (mm domain). RGB spatial
-        # registration to depth is preserved because both use the same static crop-resize size.
-        depth_transform = None
-        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
-            depth_transform = torch.nn.Sequential(
-                torchvision.transforms.CenterCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True))
 
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
