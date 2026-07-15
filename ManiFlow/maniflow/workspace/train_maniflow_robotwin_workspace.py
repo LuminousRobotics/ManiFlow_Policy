@@ -440,24 +440,29 @@ class TrainManiFlowRoboTwinWorkspace:
                     # Anchored actions => the LAST predicted chunk row is the endpoint; compare
                     # it to the true goal-in-camera-frame label (batch['goal_cam'], 6-D). Own
                     # loader with drop_last=False (predict_action has no consistency-NaN risk, so
-                    # partial batches are safe — avoids the val drop_last starvation trap).
-                    if 'goal_cam' in (val_sampling_batch or {}):
+                    # partial batches are safe — avoids the main val loader's drop_last
+                    # starvation trap; independent of val_sampling_batch for the same reason).
+                    # Datasets without goal_cam (upstream robotwin) skip silently.
+                    if len(val_dataset) > 0:
                         goal_pos_errs = []; goal_rot_errs = []
-                        val_goal_loader = torch.utils.data.DataLoader(
+                        val_goal_loader = DataLoader(
                             val_dataset, batch_size=cfg.val_dataloader.batch_size,
                             num_workers=0, shuffle=False, drop_last=False)
                         for gb in val_goal_loader:
+                            if 'goal_cam' not in gb:
+                                goal_pos_errs = []
+                                break
                             gb = dict_apply(gb, lambda x: x.to(device, non_blocking=True))
                             gpred = policy.predict_action(gb['obs'])['action_pred'][:, -1]  # (B,6) endpoint
                             gt = gb['goal_cam']                                             # (B,6)
                             goal_pos_errs.append(
                                 torch.linalg.norm(gpred[:, :3] - gt[:, :3], dim=1) * 1000.0)  # mm
-                            # rotvec geodesic: angle of (R_pred R_gt^T) ~ ||logmap||; small-angle
-                            # difference of rotvecs is an accurate proxy at these magnitudes.
+                            # small-angle rotvec difference — accurate proxy at these magnitudes
                             goal_rot_errs.append(
                                 torch.rad2deg(torch.linalg.norm(gpred[:, 3:] - gt[:, 3:], dim=1)))  # deg
-                        step_log['val_goal_pos_mm'] = torch.cat(goal_pos_errs).mean().item()
-                        step_log['val_goal_rot_deg'] = torch.cat(goal_rot_errs).mean().item()
+                        if goal_pos_errs:
+                            step_log['val_goal_pos_mm'] = torch.cat(goal_pos_errs).mean().item()
+                            step_log['val_goal_rot_deg'] = torch.cat(goal_rot_errs).mean().item()
 
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:

@@ -192,6 +192,21 @@ class TimmObsEncoder(ModuleAttrMixin):
             ] + transforms[1:]
         transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
 
+        # v3 token mode: a "depth" rgb key (name contains 'depth') is a metric depth map
+        # tiled/banded into 3 channels, NOT a photometric image. Random geometric aug
+        # (crop/rotation) is done per-key with independent RNG draws, which would DE-REGISTER
+        # it from the paired head_cam (same physical camera) — and ColorJitter / ImageNet
+        # normalization are meaningless on depth. So for depth keys in token mode: use only
+        # the deterministic geometric transform (crop+resize, matching head_cam's static part)
+        # and skip photometric aug + ImageNet norm. Depth's OWN augmentation (axial noise,
+        # dropout, flying px) already happens upstream in the dataset (mm domain). RGB spatial
+        # registration to depth is preserved because both use the same static crop-resize size.
+        depth_transform = None
+        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
+            depth_transform = torch.nn.Sequential(
+                torchvision.transforms.CenterCrop(size=int(image_shape[0] * ratio)),
+                torchvision.transforms.Resize(size=image_shape[0], antialias=True))
+
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
             type = attr.get('type', 'low_dim')
@@ -202,8 +217,11 @@ class TimmObsEncoder(ModuleAttrMixin):
                 this_model = model if share_rgb_model else copy.deepcopy(model)
                 key_model_map[key] = this_model
 
-                this_transform = transform
-                key_transform_map[key] = this_transform
+                is_depth = token_output and ('depth' in key)
+                if is_depth and depth_transform is not None:
+                    key_transform_map[key] = depth_transform
+                else:
+                    key_transform_map[key] = transform
             elif type == 'low_dim':
                 if not attr.get('ignore_by_policy', False):
                     low_dim_keys.append(key)
@@ -214,6 +232,8 @@ class TimmObsEncoder(ModuleAttrMixin):
             
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
+        # depth rgb keys skip ImageNet normalization in token mode (metric depth, not RGB)
+        self._depth_rgb_keys = {k for k in rgb_keys if token_output and ('depth' in k)}
         print('rgb keys:         ', rgb_keys)
         print('low_dim_keys keys:', low_dim_keys)
 
@@ -354,7 +374,8 @@ class TimmObsEncoder(ModuleAttrMixin):
             # the augmented pixels.
             with torch.no_grad():
                 img = self.key_transform_map[key](img).to(self.device)
-            if self.token_imagenet_norm:
+            # ImageNet norm only for photometric RGB keys (skip metric depth maps)
+            if self.token_imagenet_norm and key not in self._depth_rgb_keys:
                 img = (img - self._in_mean) / self._in_std
             raw_feature = self.key_model_map[key](img).to(self.device)
             feature = self.aggregate_feature(raw_feature)
