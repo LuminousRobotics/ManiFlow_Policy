@@ -16,6 +16,39 @@ from maniflow.common.pytorch_util import replace_submodules
 
 logger = logging.getLogger(__name__)
 
+
+def _adapt_first_conv(model, in_channels):
+    """Replace the FIRST nn.Conv2d in a (possibly truncated Sequential) trunk with one that
+    takes `in_channels` inputs, Kaiming-initialized. Used for the v3 depth trunk whose band-
+    mask channels are non-photometric, so pretrained RGB filters don't transfer. Preserves
+    out_channels/kernel/stride/padding/bias. Walks modules in definition order and swaps the
+    first Conv2d it finds (resnet 'conv1')."""
+    first = None
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            first = m
+            break
+    if first is None:
+        raise RuntimeError("no Conv2d found in trunk to adapt for depth input")
+    new_conv = nn.Conv2d(
+        in_channels, first.out_channels, kernel_size=first.kernel_size,
+        stride=first.stride, padding=first.padding, bias=(first.bias is not None))
+    nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
+    if first.bias is not None:
+        nn.init.zeros_(new_conv.bias)
+
+    # swap by identity match (replace_submodules matches by predicate; the first conv is unique)
+    replaced = {"done": False}
+
+    def _pred(x):
+        return isinstance(x, nn.Conv2d) and x is first and not replaced["done"]
+
+    def _func(x):
+        replaced["done"] = True
+        return new_conv
+
+    return replace_submodules(root_module=model, predicate=_pred, func=_func)
+
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
@@ -214,10 +247,40 @@ class TimmObsEncoder(ModuleAttrMixin):
             if type == 'rgb':
                 rgb_keys.append(key)
 
-                this_model = model if share_rgb_model else copy.deepcopy(model)
+                is_depth = token_output and ('depth' in key)
+                # depth trunk must be its OWN copy (never shared) — it has a different
+                # first-conv width (N band channels) and no ImageNet stats.
+                this_model = copy.deepcopy(model) if (is_depth or not share_rgb_model) else model
+                depth_ch = int(shape[0]) if is_depth else None
+                if is_depth and depth_ch != 3:
+                    # adapt the trunk's first conv to depth_ch input channels. Band-mask
+                    # channels are NOT photometric, so init the new conv from scratch
+                    # (Kaiming) rather than averaging pretrained RGB filters. Also swap the
+                    # depth trunk's norm -> GroupNorm (frozen ImageNet BN is meaningless on a
+                    # fresh 10-ch conv); RGB trunk keeps its FrozenBN. NOTE: if token_output+
+                    # pretrained already ran, the depth deepcopy carries FrozenBatchNorm2d
+                    # (NOT an nn.BatchNorm2d subclass), so match BOTH here.
+                    from torchvision.ops.misc import FrozenBatchNorm2d as _FBN
+
+                    def _nfeat(x):
+                        # nn.BatchNorm2d has .num_features; FrozenBatchNorm2d does not (only buffers)
+                        return getattr(x, "num_features", None) or x.weight.shape[0]
+
+                    def _to_gn(x):
+                        nf = _nfeat(x)
+                        return nn.GroupNorm(
+                            num_groups=(nf // 16) if (nf % 16 == 0) else (nf // 8),
+                            num_channels=nf)
+
+                    this_model = _adapt_first_conv(this_model, depth_ch)
+                    this_model = replace_submodules(
+                        root_module=this_model,
+                        predicate=lambda x: isinstance(x, (nn.BatchNorm2d, _FBN)),
+                        func=_to_gn)
+                    cprint(f"[TimmObsEncoder] depth trunk '{key}': first conv -> {depth_ch}ch "
+                           f"(scratch) + GroupNorm", "green")
                 key_model_map[key] = this_model
 
-                is_depth = token_output and ('depth' in key)
                 if is_depth and depth_transform is not None:
                     key_transform_map[key] = depth_transform
                 else:

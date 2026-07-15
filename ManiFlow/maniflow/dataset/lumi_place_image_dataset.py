@@ -30,10 +30,13 @@ from maniflow.common.sampler import SequenceSampler, get_val_mask, downsample_ma
 from maniflow.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from maniflow.dataset.base_dataset import BaseDataset
 
-# depth stored as uint16 millimeters (0 = invalid); normalized to [0,1] over this range.
+# depth stored as uint16 millimeters (0 = invalid). "tiled" mode normalizes to [0,1] over this max.
 DEPTH_MM_MAX = 3000.0
-# H3DP-lite depth bands (meters): near / mid / far soft masks -> 3 input channels.
-DEPTH_BANDS_M = ((0.10, 0.45), (0.35, 0.80), (0.70, 1.50))
+# v3 near-focused H3DP band EDGES (meters), data-driven (docs/v3_depth_design.md):
+# 8 fine bins over the 0.3-1.5m action zone (matte tube ~0.4-0.6m + hatrail posts, near-mode
+# median ~0.81m) + 1 mid "gap" bin (1.5-3.0m) + 1 far "background" bin (3.0-6.0m; >6m clipped
+# into it). 11 edges -> 10 channels. Verified: each near bin holds 7.5-18.7% of near-pixel mass.
+DEPTH_BAND_EDGES_M = (0.30, 0.45, 0.60, 0.75, 0.90, 1.05, 1.20, 1.35, 1.50, 3.00, 6.00)
 DEPTH_BAND_SOFT = 0.05   # meters of smooth falloff at each band edge
 
 DEFAULT_AUGMENTATION = {
@@ -118,13 +121,18 @@ class LumiPlaceImageDataset(BaseDataset):
                  max_train_episodes=None,
                  task_name=None,
                  augmentation=None,
-                 depth_input="tiled",        # "tiled" | "layered" (H3DP-lite)
+                 depth_input="tiled",        # "tiled" | "bands" (near-focused H3DP)
+                 depth_band_edges=None,      # meters; N edges -> N-1 channels (bands mode)
+                 depth_band_soft=DEPTH_BAND_SOFT,
                  **kwargs):
         super().__init__()
         self.task_name = task_name
         self.depth_input = depth_input
-        cprint(f'Loading LumiPlaceImageDataset (v6 anchored, depth={depth_input}) '
-               f'from {zarr_path}', 'green')
+        self.depth_band_edges = tuple(depth_band_edges) if depth_band_edges else DEPTH_BAND_EDGES_M
+        self.depth_band_soft = float(depth_band_soft)
+        self.depth_channels = (len(self.depth_band_edges) - 1) if depth_input == "bands" else 3
+        cprint(f'Loading LumiPlaceImageDataset (v6 anchored, depth={depth_input}, '
+               f'{self.depth_channels}ch) from {zarr_path}', 'green')
 
         buffer_keys = ['head_camera', 'depth', 'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w',
                        'cam_quat_cv', 'prev_action', 'gravity_cam', 'goal_pos_cam',
@@ -246,23 +254,40 @@ class LumiPlaceImageDataset(BaseDataset):
         return lagged
 
     def _encode_depth(self, depth_mm_float):
-        """(T,1,S,S) float mm -> (T,3,S,S) float32 in [0,1].
-        tiled: normalized depth repeated x3. layered: 3 soft depth-band masks."""
+        """(T,1,S,S) float mm -> (T,C,S,S) float32 in [0,1].
+        bands: C=(len(edges)-1) near-focused soft H3DP band masks (see docs/v3_depth_design.md);
+               invalid pixels -> all channels 0. tiled: normalized depth repeated x3.
+        The far edge acts as a CLIP: depth beyond edges[-1] still lights the last band (so
+        background collapses into ch -1 rather than vanishing)."""
         m = depth_mm_float / 1000.0                      # meters, 0 = invalid
         valid = depth_mm_float > 0
-        if self.depth_input == "layered":
+        if self.depth_input == "bands":
+            s = self.depth_band_soft
+            edges = self.depth_band_edges
             chans = []
-            for lo, hi in DEPTH_BANDS_M:
-                s = DEPTH_BAND_SOFT
+            n = len(edges) - 1
+            for i in range(n):
+                lo, hi = edges[i], edges[i + 1]
                 up = np.clip((m - (lo - s)) / s, 0.0, 1.0)
-                down = np.clip(((hi + s) - m) / s, 0.0, 1.0)
-                band = np.minimum(up, down) * valid
-                chans.append(band)
-            return np.concatenate(chans, axis=1).astype(np.float32)   # (T,3,S,S)
+                if i == n - 1:
+                    down = np.ones_like(m)               # last band: no upper cutoff (clip tail in)
+                else:
+                    down = np.clip(((hi + s) - m) / s, 0.0, 1.0)
+                chans.append(np.minimum(up, down) * valid)
+            return np.concatenate(chans, axis=1).astype(np.float32)   # (T,C,S,S)
         norm = np.clip(m / (DEPTH_MM_MAX / 1000.0), 0.0, 1.0) * valid
         return np.repeat(norm, 3, axis=1).astype(np.float32)
 
     # ------------------------------------------------------------------ sample assembly
+
+    def _check_depth_channels(self, depth_cam):
+        """Fail loud if the emitted depth channel count != shape_meta expectation (a
+        depth_input/shape_meta mismatch would otherwise surface as a cryptic conv error)."""
+        if depth_cam.shape[1] != self.depth_channels:
+            raise ValueError(
+                f"depth_cam emitted {depth_cam.shape[1]} channels but depth_channels="
+                f"{self.depth_channels} (depth_input={self.depth_input}). Align shape_meta "
+                f"depth_cam / robotwin_task.depth_channels / depth_input.")
 
     def _sample_to_data(self, sample, ep_idx=None, sample_idx=0):
         task = sample['task'][:, ].astype(np.float32)
@@ -289,6 +314,7 @@ class LumiPlaceImageDataset(BaseDataset):
 
         head_cam = sample['head_camera'][:, ].astype(np.float32) / 255.0
         depth_cam = self._encode_depth(depth_mm)
+        self._check_depth_channels(depth_cam)
 
         return {
             'obs': {

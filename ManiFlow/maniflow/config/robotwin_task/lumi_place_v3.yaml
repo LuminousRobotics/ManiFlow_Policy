@@ -7,9 +7,16 @@
 #   - action = ANCHORED-to-chunk-start camera-frame deltas (dataset builds them per sample
 #     from stored absolute poses; last row = chunk endpoint = the goal for a full descent).
 #   - goal_cam (6) rides ALONGSIDE action for the aux goal head (never an obs / ONNX input).
-#   - depth stored uint16 mm; depth_input selects tiled (default) or H3DP-lite 3-band masks.
+#   - depth stored uint16 mm; this config uses `bands` = 10 near-focused H3DP channels
+#     (docs/v3_depth_design.md). The 3-channel pooled control (B0) uses lumi_place_v3_tiled.
 
 name: lumi_place_v3
+
+# depth_cam channel count MUST equal the dataset's emitted channels: bands (len(edges)-1=10)
+# for this config. The pooled/tiled control arm (B0) selects the sibling config
+# `lumi_place_v3_tiled` (3-channel), rather than trying to reshape this one — keeps
+# shape_meta a plain int literal (no fragile in-list interpolation) and the dataset asserts
+# its emitted channels match.
 
 shape_meta:
   obs:
@@ -18,8 +25,8 @@ shape_meta:
       type: rgb
       horizon: ${n_obs_steps}
     depth_cam:
-      shape: [3, 224, 224]     # u16 mm -> 3ch (tiled) or 3 depth bands (layered)
-      type: rgb
+      shape: [10, 224, 224]    # 10 near-focused H3DP band channels (docs/v3_depth_design.md)
+      type: rgb                # encoder builds a matching 10-ch depth trunk
       horizon: ${n_obs_steps}
     prev_action:
       shape: [6]               # previous-step executed camera-frame delta (row0 = zeros)
@@ -42,7 +49,12 @@ dataset:
   seed: 42
   val_ratio: 0.1
   max_train_episodes: null
-  depth_input: tiled           # "tiled" | "layered" (H3DP-lite); B1 flips to layered
+  # depth encoding — MUST agree with shape_meta.obs.depth_cam channel count:
+  #   bands = 10 near-focused H3DP channels (matches [10,224,224]); the v3 default.
+  # (a 3-channel "tiled" run needs shape_meta depth_cam back to [3,224,224].)
+  depth_input: bands
+  depth_band_edges: [0.30, 0.45, 0.60, 0.75, 0.90, 1.05, 1.20, 1.35, 1.50, 3.00, 6.00]  # 11 edges -> 10 bins
+  depth_band_soft: 0.05        # meters of soft falloff at each band edge
   # spec 4.4 dataloader-side augmentation — zarr stays clean; overridable from
   # training_config via robotwin_task.dataset.augmentation.*
   augmentation:

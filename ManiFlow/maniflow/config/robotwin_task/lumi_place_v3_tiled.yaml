@@ -1,0 +1,48 @@
+# Lumi place-policy v3 task config — TILED depth variant (3-channel).
+# Used by the B0 control arm (pooled R3M encoder, which is 3-channel). Identical to
+# lumi_place_v3 EXCEPT depth_cam is [3,224,224] and depth_input=tiled. Selected via:
+# robotwin_task=lumi_place_v3_tiled. See docs/v3_depth_design.md.
+
+name: lumi_place_v3_tiled
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    depth_cam:
+      shape: [3, 224, 224]     # normalized depth tiled x3 (pooled R3M control)
+      type: rgb
+      horizon: ${n_obs_steps}
+    prev_action:
+      shape: [6]
+      type: low_dim
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [6]                 # anchored-to-chunk-start camera-frame deltas [dx,dy,dz,rotvec(3)]
+    horizon: ${horizon}
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  depth_input: tiled           # 3-channel normalized depth (matches shape_meta [3,224,224])
+  augmentation:
+    enable: true
+    depth_noise_sigma0: 0.005
+    depth_px_dropout: 0.02
+    depth_flying_px: 0.005
+    depth_episode_dropout: 0.4
+    prev_action_noise_mm: 0.5
+    prev_action_noise_deg: 0.05
+    latency_shift_prob: 0.5
