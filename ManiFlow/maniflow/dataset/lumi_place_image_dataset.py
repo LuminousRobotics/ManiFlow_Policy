@@ -302,9 +302,13 @@ class LumiPlaceImageDataset(BaseDataset):
             z = np.clip(m, 0.0, XYZ_SCALE_M) * vf        # (T,1,S,S) meters, clipped
             x = self._xmap[None, None] * z               # unproject: X=(u-cx)/fx * Z
             y = self._ymap[None, None] * z
-            return np.concatenate(
+            # This camera's HFOV is 93.4deg (>90), so xmap reaches ~+-1.06 at the frame
+            # edge and x/XYZ_SCALE_M can exceed 1.0 for far right-edge pixels. Clip the
+            # normalized X,Y to [-1,1] so the map stays in a sane range (the encoder's u8
+            # /255 heuristic is separately gated off for depth keys, but keep the domain tight).
+            return np.clip(np.concatenate(
                 [x / XYZ_SCALE_M, y / XYZ_SCALE_M, z / XYZ_SCALE_M, vf],
-                axis=1).astype(np.float32)               # (T,4,S,S)
+                axis=1), -1.0, 1.0).astype(np.float32)   # (T,4,S,S)
         if self.depth_input == "bands":
             s = self.depth_band_soft
             edges = self.depth_band_edges

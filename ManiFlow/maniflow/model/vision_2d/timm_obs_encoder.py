@@ -433,8 +433,13 @@ class TimmObsEncoder(ModuleAttrMixin):
         # process rgb input
         for key in self.rgb_keys:
             img = obs_dict[key]
-            # normalize image by hand
-            if img.max() > 1.0:
+            # normalize image by hand — u8 [0,255] RGB only. Depth/XYZ maps are already
+            # float-encoded (XYZ point-map in camera frame is (X,Y,Z)/2.5m + validity), and
+            # with this camera's 93.4deg HFOV the X channel legitimately reaches ~1.06 at the
+            # frame edge — so a lone far pixel would trip max()>1 and this /255 would zero the
+            # whole metric-depth tensor. Never apply the u8 heuristic to depth keys, and it
+            # also removes a data-dependent branch from the ONNX trace.
+            if key not in self._depth_rgb_keys and img.max() > 1.0:
                 # assume input in [0, 255]
                 img = img / 255.0
             if img.shape[-1] == 3:
@@ -458,13 +463,18 @@ class TimmObsEncoder(ModuleAttrMixin):
             
             assert img.shape[1:] == self.key_shape_map[key]
             # C2 shared paired crop (same offsets for every stream this forward), then
-            # resize back to the trunk input size. antialias only for photometric RGB —
-            # torchvision's AA path rejects >3 channels and AA is meaningless on metric maps.
+            # resize back to the trunk input size. antialias ONLY for photometric RGB AND
+            # ONLY in training: AA improves the quality of the train-time random-crop
+            # upsample, but (a) it's meaningless on metric depth/XYZ maps, and (b) its
+            # aten::_upsample_bilinear2d_aa op has NO ONNX symbolic in torch 2.4 — so at
+            # eval/export (deterministic center crop) we use plain bilinear, which matches
+            # the legacy export path and keeps the traced graph exportable.
             if self._paired_crop:
                 img = img[..., crop_i:crop_i + self._crop_size, crop_j:crop_j + self._crop_size]
+                aa = self.training and (key not in self._depth_rgb_keys)
                 img = F.interpolate(
                     img, size=(self._crop_out, self._crop_out), mode='bilinear',
-                    align_corners=False, antialias=(key not in self._depth_rgb_keys))
+                    align_corners=False, antialias=aa)
             # Photometric aug (ColorJitter, ...): RGB-only (depth keys hold Identity),
             # TRAINING-only, under no_grad — no learnable params, and freeing these
             # intermediates avoids multi-GB ColorJitter activations across trunks.
