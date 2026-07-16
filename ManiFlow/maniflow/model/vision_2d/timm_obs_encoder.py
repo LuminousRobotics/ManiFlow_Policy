@@ -108,6 +108,10 @@ class TimmObsEncoder(ModuleAttrMixin):
             # (no pooling); each low-dim key -> 1 projected token/frame. This un-starves
             # DiT-X cross-attention (v1/v2 collapsed all obs into a single token).
             token_output: bool=False,
+            # C2: when False (token mode), low-dim keys (prev_action/task) are NOT emitted as
+            # cross-attention tokens — the policy routes them into DiTX AdaLN-Zero instead
+            # (ManiFlow-stock proprio conditioning). Avoids double-feeding the same signal.
+            lowdim_as_tokens: bool=True,
 
         ):
         """
@@ -124,6 +128,7 @@ class TimmObsEncoder(ModuleAttrMixin):
 
         assert global_pool == ''
         self.token_output = token_output
+        self.lowdim_as_tokens = bool(lowdim_as_tokens)
         # in token mode force the dense (no-aggregation) resnet path
         if token_output and not model_name.startswith('vit'):
             feature_aggregation = None
@@ -216,29 +221,42 @@ class TimmObsEncoder(ModuleAttrMixin):
             if type == 'rgb':
                 assert image_shape is None or image_shape == shape[1:]
                 image_shape = shape[1:]
-        # v3 token mode: a "depth" rgb key (name contains 'depth') is a metric depth map
-        # banded into N channels, NOT a photometric image. Random geometric aug (crop/rotation)
-        # done per-key with independent RNG would DE-REGISTER it from the paired head_cam (same
-        # physical camera), and ColorJitter / ImageNet norm are meaningless on depth. So depth
-        # keys get ONLY a deterministic crop+resize matching head_cam's static crop size (depth's
-        # own axial/dropout aug happens upstream in the dataset). depth_transform is built HERE,
-        # inside the same block, BEFORE `transforms` is reassigned below (else the re-test would
-        # fail once transforms[0] becomes an nn.Module and depth would wrongly fall back to the
-        # RGB stack — which uses antialias=True and rejects >3 channels).
-        # antialias=False: torchvision's AA path only accepts 1/3 channels ("permitted channel
-        # values are [1,3], but found N"); AA is meaningless on discrete band-masks anyway.
-        depth_transform = None
+        # C2 transform scheme (supersedes the v3 per-key stacks):
+        #  - ONE shared crop per forward pass, applied IDENTICALLY to every image stream
+        #    (head_cam + depth/xyz): random offset in training, center crop at eval/export.
+        #    The v3 scheme (RandomCrop on RGB, CenterCrop on depth, independent RNG) DE-
+        #    REGISTERED the two token grids from each other every sample, making cross-modal
+        #    spatial fusion impossible; and torchvision transform modules stay random in
+        #    .eval(), so validation/selection metrics were measured through random aug.
+        #    The paired crop fixes both: registered streams + deterministic eval.
+        #  - RandomRotation is DROPPED: rotating pixels while the camera-frame metric labels
+        #    stay fixed injects ~±20-30mm of label inconsistency at our ranges, and would
+        #    de-register metric XYZ/depth channels from the labels.
+        #  - Photometric transforms (ColorJitter, ...) are kept, RGB-only, TRAINING-only.
+        #  - XYZ point-map channels are crop-SAFE by construction: each pixel carries its own
+        #    metric camera-frame coordinates, which do not depend on where the pixel lands
+        #    after cropping.
+        self._paired_crop = False
+        self._crop_size = None
+        self._crop_out = None
+        photometric = []
         if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
             assert transforms[0].type == 'RandomCrop'
             ratio = transforms[0].ratio
-            depth_transform = torch.nn.Sequential(
-                torchvision.transforms.CenterCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=False))
-            transforms = [
-                torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True)
-            ] + transforms[1:]
-        transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+            self._paired_crop = True
+            self._crop_size = int(image_shape[0] * ratio)
+            self._crop_out = int(image_shape[0])
+            for t in transforms[1:]:
+                if isinstance(t, torchvision.transforms.RandomRotation):
+                    cprint("[TimmObsEncoder] dropping RandomRotation (label-inconsistent with "
+                           "camera-frame metric targets)", "yellow")
+                    continue
+                photometric.append(t)
+        elif transforms is not None:
+            photometric = [t for t in transforms
+                           if not isinstance(t, torchvision.transforms.RandomRotation)]
+        photometric_stack = (nn.Identity() if len(photometric) == 0
+                             else torch.nn.Sequential(*photometric))
 
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
@@ -281,10 +299,8 @@ class TimmObsEncoder(ModuleAttrMixin):
                            f"(scratch) + GroupNorm", "green")
                 key_model_map[key] = this_model
 
-                if is_depth and depth_transform is not None:
-                    key_transform_map[key] = depth_transform
-                else:
-                    key_transform_map[key] = transform
+                # photometric aug is meaningless on metric depth/XYZ channels
+                key_transform_map[key] = nn.Identity() if is_depth else photometric_stack
             elif type == 'low_dim':
                 if not attr.get('ignore_by_policy', False):
                     low_dim_keys.append(key)
@@ -318,7 +334,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         if self.token_imagenet_norm:
             self.register_buffer('_in_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
             self.register_buffer('_in_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        if token_output:
+        if token_output and self.lowdim_as_tokens:
             self.lowdim_proj = nn.ModuleDict({
                 key: nn.Linear(int(np.prod(key_shape_map[key])), feature_dim)
                 for key in low_dim_keys})
@@ -401,7 +417,19 @@ class TimmObsEncoder(ModuleAttrMixin):
     def forward(self, obs_dict):
         features = list()
         batch_size = next(iter(obs_dict.values())).shape[0]
-        
+
+        # C2: ONE shared crop offset per forward pass, applied identically to every image
+        # stream so RGB and depth/XYZ token grids stay registered. Random in training,
+        # center in eval/export (deterministic validation + static ONNX slices).
+        crop_i = crop_j = 0
+        if self._paired_crop and len(self.rgb_keys) > 0:
+            max_off = int(self.key_shape_map[self.rgb_keys[0]][1]) - self._crop_size
+            if self.training and max_off > 0:
+                crop_i = int(torch.randint(0, max_off + 1, (1,)).item())
+                crop_j = int(torch.randint(0, max_off + 1, (1,)).item())
+            else:
+                crop_i = crop_j = max_off // 2
+
         # process rgb input
         for key in self.rgb_keys:
             img = obs_dict[key]
@@ -429,14 +457,20 @@ class TimmObsEncoder(ModuleAttrMixin):
                 img = F.interpolate(img, size=(target_H, target_W), mode='bilinear', align_corners=False)
             
             assert img.shape[1:] == self.key_shape_map[key]
-            # Image augmentation (RandomCrop/Rotation/ColorJitter) has no learnable
-            # params, so its intermediates never need to be retained for backward.
-            # Running it under no_grad frees several GB of activations (ColorJitter's
-            # hsv2rgb einsum alone is multi-GB across two trunks x B*T images) and
-            # avoids OOM. The trainable encoder below still backprops normally from
-            # the augmented pixels.
-            with torch.no_grad():
-                img = self.key_transform_map[key](img).to(self.device)
+            # C2 shared paired crop (same offsets for every stream this forward), then
+            # resize back to the trunk input size. antialias only for photometric RGB —
+            # torchvision's AA path rejects >3 channels and AA is meaningless on metric maps.
+            if self._paired_crop:
+                img = img[..., crop_i:crop_i + self._crop_size, crop_j:crop_j + self._crop_size]
+                img = F.interpolate(
+                    img, size=(self._crop_out, self._crop_out), mode='bilinear',
+                    align_corners=False, antialias=(key not in self._depth_rgb_keys))
+            # Photometric aug (ColorJitter, ...): RGB-only (depth keys hold Identity),
+            # TRAINING-only, under no_grad — no learnable params, and freeing these
+            # intermediates avoids multi-GB ColorJitter activations across trunks.
+            if self.training and not isinstance(self.key_transform_map[key], nn.Identity):
+                with torch.no_grad():
+                    img = self.key_transform_map[key](img).to(self.device)
             # ImageNet norm only for photometric RGB keys (skip metric depth maps)
             if self.token_imagenet_norm and key not in self._depth_rgb_keys:
                 img = (img - self._in_mean) / self._in_std
@@ -451,17 +485,20 @@ class TimmObsEncoder(ModuleAttrMixin):
                 features.append(feature.reshape(B, -1))
 
         # process lowdim input
-        for key in self.low_dim_keys:
-            data = obs_dict[key].to(self.device)
-            B, T = data.shape[:2]
-            assert B == batch_size
-            assert data.shape[2:] == self.key_shape_map[key]
-            if self.token_output:
-                # (B,T,*) -> one projected token per frame: (B, T, D)
-                tok = self.lowdim_proj[key](data.reshape(B, T, -1))
-                features.append(tok)
-            else:
-                features.append(data.reshape(B, -1))
+        # C2: with lowdim_as_tokens=False (token mode) low-dim keys are handled by the
+        # policy (DiTX AdaLN-Zero conditioning) and are NOT emitted as cross-attn tokens.
+        if not (self.token_output and not self.lowdim_as_tokens):
+            for key in self.low_dim_keys:
+                data = obs_dict[key].to(self.device)
+                B, T = data.shape[:2]
+                assert B == batch_size
+                assert data.shape[2:] == self.key_shape_map[key]
+                if self.token_output:
+                    # (B,T,*) -> one projected token per frame: (B, T, D)
+                    tok = self.lowdim_proj[key](data.reshape(B, T, -1))
+                    features.append(tok)
+                else:
+                    features.append(data.reshape(B, -1))
 
         # token mode: concat on the TOKEN axis -> (B, L, D); the policy passes this
         # straight to DiT-X cross-attention (its reshape(B,-1,D) is then a no-op).

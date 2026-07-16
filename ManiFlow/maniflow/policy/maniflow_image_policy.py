@@ -50,6 +50,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             # --- Lumi v3 auxiliary goal head (default OFF => no goal head built) ---
             goal_loss_weight=0.0,              # lambda for the goal-in-camera-frame aux head (Huber); 0 => off
             goal_loss_type="huber",            # "huber" | "mse"
+            # --- Lumi C2: low-dim -> AdaLN-Zero routing (default OFF => stock v3 behaviour) ---
+            lowdim_to_adaln=False,             # route prev_action/task into DiTX AdaLN instead of cross-attn tokens
+            proprio_mask_p=0.0,                # per-sample prob of zeroing prev_action during training (GAP/ManiFlow
+                                               # proprio masking: keeps vision load-bearing for goal localization)
             **kwargs):
         super().__init__()
 
@@ -65,7 +69,25 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-        
+
+        # --- Lumi C2: low-dim (prev_action/task) -> AdaLN-Zero conditioning ---
+        # When enabled the encoder should be configured with lowdim_as_tokens=false so the
+        # same signal is not double-fed via cross-attention. Flattened layout is
+        # [prev_action(To*6) | task(To*1)] — prev_action FIRST (the masking slice relies on it).
+        self.lowdim_to_adaln = bool(lowdim_to_adaln)
+        self.proprio_mask_p = float(proprio_mask_p)
+        self.lowdim_adaln_keys = [k for k in ('prev_action', 'task') if k in obs_shape_meta]
+        lowdim_cond_dim = 0
+        self._pa_flat_dim = 0
+        if self.lowdim_to_adaln:
+            assert self.lowdim_adaln_keys, "lowdim_to_adaln=True but no prev_action/task in shape_meta"
+            lowdim_cond_dim = int(n_obs_steps) * sum(
+                int(np.prod(obs_shape_meta[k]['shape'])) for k in self.lowdim_adaln_keys)
+            if 'prev_action' in obs_shape_meta:
+                self._pa_flat_dim = int(n_obs_steps) * int(np.prod(obs_shape_meta['prev_action']['shape']))
+            cprint(f"[ManiFlow C2] low-dim -> AdaLN-Zero: keys={self.lowdim_adaln_keys} "
+                   f"dim={lowdim_cond_dim} proprio_mask_p={self.proprio_mask_p}", "green")
+
         # create ManiFlow model
         obs_feature_dim = obs_encoder.output_shape()[-1]
         input_dim = action_dim + obs_feature_dim
@@ -92,6 +114,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             qk_norm=qk_norm,
             block_type=block_type,
             language_conditioned=language_conditioned,
+            lowdim_cond_dim=lowdim_cond_dim,
         )
         
         self.obs_encoder = obs_encoder
@@ -181,8 +204,26 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         print_params(self)
         
     # ========= inference  ============
-    def conditional_sample(self, 
-            condition_data, 
+    def _build_lowdim_cond(self, nobs, batch_size, To, device, train_mask=False):
+        """Lumi C2: flatten normalized low-dim obs (prev_action/task over the To obs frames)
+        into the DiTX AdaLN conditioning vector. Layout [prev_action | task] (prev first —
+        the masking slice depends on it). train_mask applies per-sample proprio dropout
+        (zero the prev_action slab with prob proprio_mask_p) so the policy cannot lean on
+        proprioception alone and vision stays load-bearing for goal localization."""
+        if not self.lowdim_to_adaln:
+            return None
+        parts = [nobs[k][:, :To].reshape(batch_size, -1).to(device)
+                 for k in self.lowdim_adaln_keys]
+        cond = torch.cat(parts, dim=-1)
+        if train_mask and self.proprio_mask_p > 0.0 and self._pa_flat_dim > 0:
+            keep = (torch.rand(batch_size, 1, device=cond.device)
+                    >= self.proprio_mask_p).to(cond.dtype)
+            cond = torch.cat([cond[:, :self._pa_flat_dim] * keep,
+                              cond[:, self._pa_flat_dim:]], dim=-1)
+        return cond
+
+    def conditional_sample(self,
+            condition_data,
             vis_cond=None,
             lang_cond=None,
             **kwargs
@@ -235,16 +276,19 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         # condition through visual feature
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
-        nobs_features = self.obs_encoder(this_nobs).to(device) 
+        nobs_features = self.obs_encoder(this_nobs).to(device)
         vis_cond = nobs_features.reshape(B, -1, Do) # B, self.n_obs_steps*L, Do
+        # Lumi C2: compact control conditioning for AdaLN (no masking at inference)
+        lowdim_cond = self._build_lowdim_cond(nobs, B, To, device)
         # empty data for action
         cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
 
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             vis_cond=vis_cond,
             lang_cond=lang_cond,
+            lowdim_cond=lowdim_cond,
             **self.kwargs)
         
         # unnormalize prediction
@@ -419,6 +463,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # get visual and language conditions
         vis_cond = model_kwargs.get('vis_cond', None)
         lang_cond = model_kwargs.get('lang_cond', None)
+        lowdim_cond = model_kwargs.get('lowdim_cond', None)  # Lumi C2 AdaLN conditioning
         ema_model = model_kwargs.get('ema_model', None)
         consistency_batchsize = actions.shape[0]
         device = actions.device
@@ -454,12 +499,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # predict the average velocity from t_next toward next target (t_next + delta_t2)
         with torch.no_grad():
             v_avg_to_next_target = ema_model.model(
-                sample=x_t_next, 
+                sample=x_t_next,
                 timestep=t_next.squeeze(),
-                target_t=target_t_next.squeeze(), 
+                target_t=target_t_next.squeeze(),
                 vis_cond=vis_cond[-consistency_batchsize:],
                 lang_cond=lang_cond[-consistency_batchsize:] if lang_cond is not None else None,
-            ) 
+                lowdim_cond=lowdim_cond[-consistency_batchsize:] if lowdim_cond is not None else None,
+            )
         # predict the target data point using the average velocity
         pred_x1_ct = x_t_next + (1 - t_next) * v_avg_to_next_target
         # estimate the velocity at t by using the predicted endpoint
@@ -539,40 +585,46 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             assert lang_cond is not None, "Language goal is required"
 
         # reshape B, T, ... to B*T
-        this_nobs = dict_apply(nobs, 
+        this_nobs = dict_apply(nobs,
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
         vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
-        
+        # Lumi C2: AdaLN control conditioning; proprio masking active in training only
+        lowdim_cond = self._build_lowdim_cond(
+            nobs, batch_size, self.n_obs_steps, self.device, train_mask=self.training)
+
         """Get flow and consistency targets"""
         flow_batchsize = int(batch_size * self.flow_batch_ratio)
         consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
-    
+
 
         # Get flow targets
-        flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
+        flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize],
                                                     vis_cond=vis_cond[:flow_batchsize],
                                                     lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
         v_flow_pred = self.model(
-            sample=flow_target_dict['x_t'], 
+            sample=flow_target_dict['x_t'],
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
+            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+            lowdim_cond=lowdim_cond[:flow_batchsize] if lowdim_cond is not None else None)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency targets
         consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
                                                                         vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
                                                                         lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+                                                                        lowdim_cond=lowdim_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lowdim_cond is not None else None,
                                                                         ema_model=ema_model
                                                                         )
         v_ct_pred = self.model(
-            sample=consistency_target_dict['x_t'], 
+            sample=consistency_target_dict['x_t'],
             timestep=consistency_target_dict['t'].squeeze(),
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
             lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+            lowdim_cond=lowdim_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lowdim_cond is not None else None,
             )
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 

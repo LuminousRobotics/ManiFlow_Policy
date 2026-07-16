@@ -47,6 +47,9 @@ policy:
   # --- Lumi v3 auxiliary goal head (default OFF => no head built). ---
   goal_loss_weight: 0.0            # lambda for goal-in-camera-frame aux head (Huber); 0 => off
   goal_loss_type: "huber"          # "huber" | "mse"
+  # --- Lumi C2: low-dim -> AdaLN-Zero routing (default OFF => stock v3 cross-attn tokens) ---
+  lowdim_to_adaln: false           # prev_action/task drive AdaLN (pair with obs_encoder.lowdim_as_tokens=false)
+  proprio_mask_p: 0.0              # per-sample training prob of zeroing prev_action (keeps vision load-bearing)
 
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128
@@ -94,15 +97,15 @@ policy:
     # v3 dense-token conditioning (default OFF => v1/v2 single-token behaviour). B1 sets
     # token_output=True + model_name='resnet18.a1_in1k' + pretrained=True via training_config.
     token_output: False
+    # C2: when False (with token_output), prev_action/task are NOT cross-attn tokens —
+    # the policy routes them into DiTX AdaLN-Zero (pair with policy.lowdim_to_adaln=true).
+    lowdim_as_tokens: True
 
     transforms:
       - type: RandomCrop
         ratio: 0.95
-      - _target_: torchvision.transforms.RandomRotation
-        degrees:
-          - -5.0
-          - 5.0
-        expand: false
+      # C2: RandomRotation REMOVED — rotating pixels while camera-frame metric action/goal
+      # labels stay fixed injects ~±20-30mm label inconsistency at our working ranges.
       - _target_: torchvision.transforms.ColorJitter
         brightness: 0.3
         contrast: 0.4

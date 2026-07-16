@@ -1,0 +1,45 @@
+# Lumi place-policy C2 CONTROL arm — RGB-ONLY (no depth stream at all).
+# Selected at launch via: robotwin_task=lumi_place_v3_rgb
+#
+# Purpose: settle "do we need depth?" with a controlled ablation. Evidence pointing at
+# RGB-only being competitive: DP3's ablation had RGB-D-as-images BELOW plain RGB; the
+# v0.1.4 model already trained with depth episode-dropped 40% of the time (so its
+# performance is largely depth-free); and depth sensors fail on the specular panel glass.
+# If this arm ties C2-xyz on success@15mm, the depth trunk is dead weight (faster train
+# + inference); if xyz wins, metric geometry earns its place.
+
+name: lumi_place_v3_rgb
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    prev_action:
+      shape: [6]               # previous-step executed camera-frame delta (row0 = zeros)
+      type: low_dim
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]               # [neighbor_present]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [6]                 # anchored-to-chunk-start camera-frame deltas [dx,dy,dz,rotvec(3)]
+    horizon: ${horizon}
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???               # override at launch: robotwin_task.dataset.zarr_path=...
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  use_depth: false             # no depth stream: no zarr depth read, no depth_cam in obs
+  augmentation:
+    enable: true
+    prev_action_noise_mm: 0.5
+    prev_action_noise_deg: 0.05
+    latency_shift_prob: 0.5

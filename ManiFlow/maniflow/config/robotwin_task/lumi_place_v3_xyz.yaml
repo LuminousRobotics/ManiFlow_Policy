@@ -1,0 +1,58 @@
+# Lumi place-policy C2 task config — XYZ POINT-MAP depth (ConversionVersion v6, ANCHORED).
+# Selected at launch via: robotwin_task=lumi_place_v3_xyz
+#
+# C2 vs v3 (lumi_place_v3):
+#   - depth_cam = 4-channel ordered POINT-MAP: per-pixel metric camera-frame (X,Y,Z)/2.5m
+#     + validity, unprojected from the stored u16-mm depth + meta/camera_K. Continuous
+#     (per-mm gradient — the 10-band H3DP encoding had ~50mm dead zones and could not
+#     resolve the 15mm target), crop-safe, and hands the model metric ranging directly.
+#     The v0.1.4 eval's ~24%-of-distance goal error was the monocular-RGB-ranging
+#     signature this fixes.
+#   - depth_episode_dropout 0.4 -> 0.1: 40% taught the model depth was optional; a small
+#     rate keeps the robustness story without destroying the learning signal.
+#   - pair with policy.lowdim_to_adaln=true + obs_encoder.lowdim_as_tokens=false
+#     (prev_action/task -> AdaLN-Zero) via training_config.
+
+name: lumi_place_v3_xyz
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    depth_cam:
+      shape: [4, 224, 224]     # X, Y, Z (camera frame, /2.5m) + valid — ordered point-map
+      type: rgb                # encoder builds a matching 4-ch scratch-conv trunk
+      horizon: ${n_obs_steps}
+    prev_action:
+      shape: [6]               # previous-step executed camera-frame delta (row0 = zeros)
+      type: low_dim
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]               # [neighbor_present]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [6]                 # anchored-to-chunk-start camera-frame deltas [dx,dy,dz,rotvec(3)]
+    horizon: ${horizon}
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???               # override at launch: robotwin_task.dataset.zarr_path=...
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  depth_input: xyz             # 4-channel point-map — MUST match shape_meta depth_cam [4,...]
+  augmentation:
+    enable: true
+    depth_noise_sigma0: 0.005
+    depth_px_dropout: 0.02
+    depth_flying_px: 0.005
+    depth_episode_dropout: 0.1   # C2: was 0.4 — that trained the model to ignore depth
+    prev_action_noise_mm: 0.5
+    prev_action_noise_deg: 0.05
+    latency_shift_prob: 0.5      # prev_action only — depth never lags independently of RGB (C2)

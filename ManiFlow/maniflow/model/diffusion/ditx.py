@@ -62,12 +62,14 @@ class DiTX(nn.Module):
         pre_norm_modality: bool = False,
         language_conditioned: bool=False,
         language_model: str = "t5-small",
+        lowdim_cond_dim: int = 0,
     ):
         super().__init__()
         self.n_obs_steps = n_obs_steps
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
+        self.lowdim_cond_dim = int(lowdim_cond_dim)
         
         # constants
         T = horizon
@@ -107,6 +109,21 @@ class DiTX(nn.Module):
         self.flow_timestep_encoder = flow_timestep_encoder
         self.flow_target_t_encoder = flow_target_t_encoder
         self.timestep_target_t_adaptor = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+
+        # --- Lumi C2: low-dim conditioning fused into the AdaLN-Zero driver ---
+        # ManiFlow's stock DiT-X routes proprioception through AdaLN-Zero (paper Fig.5) while
+        # vision/language go through cross-attention. Our image pipeline had drifted from
+        # that: prev_action (= current velocity) + task were 2 tokens diluted among ~200
+        # image tokens in cross-attention KV. This restores the intended split: a compact
+        # global control vector is fused ADDITIVELY into time_c so it drives every block's
+        # scale/shift/gate. Zero-init of the last layer => exact no-op at init (AdaLN-Zero
+        # philosophy); a warm start without these params behaves identically at step 0.
+        if self.lowdim_cond_dim > 0:
+            self.lowdim_cond_mlp = nn.Sequential(
+                nn.Linear(self.lowdim_cond_dim, n_emb),
+                nn.SiLU(),
+                nn.Linear(n_emb, n_emb),
+            )
 
         # Language conditioning, use T5-small as default
         if self.language_conditioned:
@@ -273,6 +290,14 @@ class DiTX(nn.Module):
         nn.init.normal_(self.timestep_target_t_adaptor.weight, std=0.02)
         nn.init.constant_(self.timestep_target_t_adaptor.bias, 0)
 
+        # Lumi C2: zero-out the low-dim AdaLN fusion output layer => identity at init
+        # (same philosophy as the adaLN_modulation zero-init above).
+        if self.lowdim_cond_dim > 0:
+            nn.init.normal_(self.lowdim_cond_mlp[0].weight, std=0.02)
+            nn.init.constant_(self.lowdim_cond_mlp[0].bias, 0)
+            nn.init.zeros_(self.lowdim_cond_mlp[-1].weight)
+            nn.init.zeros_(self.lowdim_cond_mlp[-1].bias)
+
         if self.language_conditioned:
             # Initialize the language condition adapter
             nn.init.normal_(self.lang_adaptor[0].weight, std=0.02)
@@ -368,12 +393,13 @@ class DiTX(nn.Module):
         return optimizer
 
 
-    def forward(self, 
-            sample: torch.Tensor, 
-            timestep: Union[torch.Tensor, float, int], 
-            target_t: Union[torch.Tensor, float, int], 
+    def forward(self,
+            sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int],
+            target_t: Union[torch.Tensor, float, int],
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
+            lowdim_cond: torch.Tensor = None,
             **kwargs):
         """
         Forward pass of the DiTX model.
@@ -381,10 +407,12 @@ class DiTX(nn.Module):
             x: (B,T,input_dim)
             timestep: (B,) or int, maniflow time step t
             target_t: (B,) or float, the target absolute or relative time for the consistency flow training process
-            vis_cond: (B,T, vis_cond_dim) 
+            vis_cond: (B,T, vis_cond_dim)
             lang_cond: (B,) or list of strings, language condition input
+            lowdim_cond: (B, lowdim_cond_dim) compact control signals (prev_action/task,
+                flattened over n_obs_steps) fused into the AdaLN-Zero driver; None => off
             **kwargs: additional arguments
-        output: 
+        output:
             action: (B,T,output_dim)
         """
 
@@ -416,7 +444,12 @@ class DiTX(nn.Module):
         
         time_c = torch.cat([timestep_embed, target_t_embed], dim=-1) # (B, 2*n_emb)
         time_c = self.timestep_target_t_adaptor(time_c) # (B, n_emb)
-        
+
+        # 2b. low-dim conditioning (prev_action / task) fused into the AdaLN driver so it
+        # modulates every block's scale/shift/gate (ManiFlow-stock proprio routing).
+        if self.lowdim_cond_dim > 0 and lowdim_cond is not None:
+            time_c = time_c + self.lowdim_cond_mlp(lowdim_cond)
+
 
         # 3. visual condition
         vis_con_obs_emb = self.vis_cond_obs_emb(vis_cond) # (B, L, n_emb)

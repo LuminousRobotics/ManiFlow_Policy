@@ -370,6 +370,12 @@ class TrainManiFlowRoboTwinWorkspace:
             if cfg.training.use_ema:
                 policy = self.ema_model
             policy.eval()
+            # C2: also eval() the RAW model — val_loss / val_action_mse_error go through
+            # self.model.compute_loss, which previously ran in TRAIN mode during validation
+            # (dropout active + random image aug; torchvision transform modules ignore
+            # train/eval, and the C2 paired-crop gates on self.training). eval() here makes
+            # every validation metric deterministic; restored to train() at eval end.
+            self.model.eval()
 
             # run rollout
             if cfg.training.debug:
@@ -537,6 +543,7 @@ class TrainManiFlowRoboTwinWorkspace:
 
             # ========= eval end for this epoch ==========
             policy.train()
+            self.model.train()   # C2: restore after the val-determinism eval() above
 
             # end of epoch
             # log of last step is combined with validation and rollout

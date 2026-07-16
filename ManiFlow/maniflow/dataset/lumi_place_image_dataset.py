@@ -22,6 +22,7 @@ import copy
 
 import numpy as np
 import torch
+import zarr
 from termcolor import cprint
 
 from maniflow.common.pytorch_util import dict_apply
@@ -38,6 +39,10 @@ DEPTH_MM_MAX = 3000.0
 # into it). 11 edges -> 10 channels. Verified: each near bin holds 7.5-18.7% of near-pixel mass.
 DEPTH_BAND_EDGES_M = (0.30, 0.45, 0.60, 0.75, 0.90, 1.05, 1.20, 1.35, 1.50, 3.00, 6.00)
 DEPTH_BAND_SOFT = 0.05   # meters of smooth falloff at each band edge
+# C2 "xyz" point-map mode: one metric scale for X, Y and Z (isotropy preserved so the
+# trunk sees true relative distances). Z is clipped to this range; the sub-mm u16 source
+# resolution is preserved (the 0.15m band bins threw it away). MUST match eval_policy.
+XYZ_SCALE_M = 2.5
 
 DEFAULT_AUGMENTATION = {
     "enable": True,
@@ -121,23 +126,50 @@ class LumiPlaceImageDataset(BaseDataset):
                  max_train_episodes=None,
                  task_name=None,
                  augmentation=None,
-                 depth_input="tiled",        # "tiled" | "bands" (near-focused H3DP)
+                 depth_input="tiled",        # "tiled" | "bands" (H3DP) | "xyz" (point-map)
                  depth_band_edges=None,      # meters; N edges -> N-1 channels (bands mode)
                  depth_band_soft=DEPTH_BAND_SOFT,
+                 use_depth=True,             # C2-rgb control arm: no depth stream at all
                  **kwargs):
         super().__init__()
         self.task_name = task_name
+        self.use_depth = bool(use_depth)
         self.depth_input = depth_input
         self.depth_band_edges = tuple(depth_band_edges) if depth_band_edges else DEPTH_BAND_EDGES_M
         self.depth_band_soft = float(depth_band_soft)
-        self.depth_channels = (len(self.depth_band_edges) - 1) if depth_input == "bands" else 3
-        cprint(f'Loading LumiPlaceImageDataset (v6 anchored, depth={depth_input}, '
+        if depth_input == "bands":
+            self.depth_channels = len(self.depth_band_edges) - 1
+        elif depth_input == "xyz":
+            self.depth_channels = 4          # X, Y, Z (camera frame, /XYZ_SCALE_M) + valid
+        else:
+            self.depth_channels = 3
+        cprint(f'Loading LumiPlaceImageDataset (v6 anchored, depth='
+               f'{depth_input if self.use_depth else "OFF"}, '
                f'{self.depth_channels}ch) from {zarr_path}', 'green')
 
-        buffer_keys = ['head_camera', 'depth', 'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w',
+        buffer_keys = ['head_camera', 'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w',
                        'cam_quat_cv', 'prev_action', 'gravity_cam', 'goal_pos_cam',
                        'goal_rot_cam', 'task']
+        if self.use_depth:
+            buffer_keys.insert(1, 'depth')
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=buffer_keys)
+
+        # C2 "xyz" point-map mode: unproject each depth pixel to metric camera-frame
+        # coordinates using the stored intrinsics — the goal's 3D position becomes a
+        # READOUT from the input rather than a monocular-scale inference (the v0.1.4
+        # eval showed a ~24%-of-distance fractional ranging error = RGB scale cues).
+        # Values are crop-safe: a pixel's (X,Y,Z) does not depend on where the crop
+        # places it. camera_K is [fx, fy, cx, cy] at the STORED resolution.
+        if self.use_depth and depth_input == "xyz":
+            K = np.asarray(zarr.open(str(zarr_path), mode='r')['meta']['camera_K'][:],
+                           dtype=np.float64).reshape(-1)
+            fx, fy, cx, cy = float(K[0]), float(K[1]), float(K[2]), float(K[3])
+            S = int(self.replay_buffer['depth'].shape[-1])
+            us = np.arange(S, dtype=np.float32)
+            vs = np.arange(S, dtype=np.float32)
+            uu, vv = np.meshgrid(us, vs)                 # (S,S), uu = x-pixel, vv = y-pixel
+            self._xmap = ((uu - cx) / fx).astype(np.float32)
+            self._ymap = ((vv - cy) / fy).astype(np.float32)
 
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes, val_ratio=val_ratio, seed=seed)
@@ -209,7 +241,8 @@ class LumiPlaceImageDataset(BaseDataset):
             },
             last_n_dims=1, mode=mode, **kwargs)
         normalizer['head_cam'] = SingleFieldLinearNormalizer.create_identity()
-        normalizer['depth_cam'] = SingleFieldLinearNormalizer.create_identity()
+        if self.use_depth:
+            normalizer['depth_cam'] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
 
     def __len__(self) -> int:
@@ -254,13 +287,24 @@ class LumiPlaceImageDataset(BaseDataset):
         return lagged
 
     def _encode_depth(self, depth_mm_float):
-        """(T,1,S,S) float mm -> (T,C,S,S) float32 in [0,1].
+        """(T,1,S,S) float mm -> (T,C,S,S) float32.
+        xyz:   C=4 ordered POINT-MAP — each pixel's metric camera-frame (X,Y,Z)/XYZ_SCALE_M
+               + validity. Continuous (per-mm gradient everywhere; the band encoding had
+               ~50mm dead zones), crop-safe, and hands the model metric ranging directly.
         bands: C=(len(edges)-1) near-focused soft H3DP band masks (see docs/v3_depth_design.md);
                invalid pixels -> all channels 0. tiled: normalized depth repeated x3.
         The far edge acts as a CLIP: depth beyond edges[-1] still lights the last band (so
         background collapses into ch -1 rather than vanishing)."""
         m = depth_mm_float / 1000.0                      # meters, 0 = invalid
         valid = depth_mm_float > 0
+        if self.depth_input == "xyz":
+            vf = valid.astype(np.float32)
+            z = np.clip(m, 0.0, XYZ_SCALE_M) * vf        # (T,1,S,S) meters, clipped
+            x = self._xmap[None, None] * z               # unproject: X=(u-cx)/fx * Z
+            y = self._ymap[None, None] * z
+            return np.concatenate(
+                [x / XYZ_SCALE_M, y / XYZ_SCALE_M, z / XYZ_SCALE_M, vf],
+                axis=1).astype(np.float32)               # (T,4,S,S)
         if self.depth_input == "bands":
             s = self.depth_band_soft
             edges = self.depth_band_edges
@@ -292,7 +336,8 @@ class LumiPlaceImageDataset(BaseDataset):
     def _sample_to_data(self, sample, ep_idx=None, sample_idx=0):
         task = sample['task'][:, ].astype(np.float32)
         prev_action = sample['prev_action'][:, ].astype(np.float32)
-        depth_mm = sample['depth'][:, ].astype(np.float32)   # (T,1,S,S) mm (float for aug)
+        depth_mm = (sample['depth'][:, ].astype(np.float32)   # (T,1,S,S) mm (float for aug)
+                    if self.use_depth else None)
 
         anchor = min(self.pad_before, len(sample['tcp_pos_w']) - 1)
         action = build_anchored_chunk(
@@ -303,26 +348,31 @@ class LumiPlaceImageDataset(BaseDataset):
         if self.augment and ep_idx is not None:
             ep_rng = np.random.default_rng([self.seed, 1000003, ep_idx])
             sample_rng = np.random.default_rng([self.seed, 7777777, ep_idx, sample_idx])
-            depth_mm = self._augment_depth_mm(depth_mm, ep_rng, sample_rng)
+            if depth_mm is not None:
+                depth_mm = self._augment_depth_mm(depth_mm, ep_rng, sample_rng)
             prev_action = self._augment_prev_action(prev_action, sample_rng)
             lat_rng = np.random.default_rng([self.seed, 424243, ep_idx])
             p = self.aug["latency_shift_prob"]
-            if lat_rng.random() < p:
-                depth_mm = self._lag_one_tick(depth_mm)
+            # C2: depth is the SAME physical camera as head_cam — never lag it independently
+            # of RGB (the v3 independent lag de-synced the streams on ~50% of samples and
+            # taught the model depth was temporally unreliable). Only prev_action (a
+            # different sensor path with real latency) keeps the lag augmentation.
             if lat_rng.random() < p:
                 prev_action = self._lag_one_tick(prev_action)
 
         head_cam = sample['head_camera'][:, ].astype(np.float32) / 255.0
-        depth_cam = self._encode_depth(depth_mm)
-        self._check_depth_channels(depth_cam)
+        obs = {
+            'head_cam': head_cam,
+            'prev_action': prev_action,
+            'task': task,
+        }
+        if depth_mm is not None:
+            depth_cam = self._encode_depth(depth_mm)
+            self._check_depth_channels(depth_cam)
+            obs['depth_cam'] = depth_cam
 
         return {
-            'obs': {
-                'head_cam': head_cam,
-                'depth_cam': depth_cam,
-                'prev_action': prev_action,
-                'task': task,
-            },
+            'obs': obs,
             'action': action,
             'goal_cam': goal_cam,       # supervision only; NOT in obs / ONNX
         }
