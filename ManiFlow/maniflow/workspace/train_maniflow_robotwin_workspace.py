@@ -54,6 +54,31 @@ from maniflow.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+
+def _rotvec_to_mat(rv):
+    """Batched Rodrigues: rotvec (B,3) -> rotation matrix (B,3,3) (torch)."""
+    theta = torch.linalg.norm(rv, dim=-1, keepdim=True)                 # (B,1)
+    axis = rv / theta.clamp_min(1e-8)
+    x, y, z = axis[:, 0], axis[:, 1], axis[:, 2]
+    zero = torch.zeros_like(x)
+    K = torch.stack([zero, -z, y, z, zero, -x, -y, x, zero], dim=-1).reshape(-1, 3, 3)
+    I = torch.eye(3, device=rv.device, dtype=rv.dtype).expand(rv.shape[0], 3, 3)
+    s = torch.sin(theta).unsqueeze(-1)
+    c = (1.0 - torch.cos(theta)).unsqueeze(-1)
+    return I + s * K + c * (K @ K)
+
+
+def _geodesic_deg(rvA, rvB):
+    """Geodesic angle (deg) between two rotvec batches (B,3) via composed matrices
+    (Rrel = Ra @ Rb^T). Correct at all magnitudes — unlike the Euclidean rotvec diff,
+    which is only accurate for tiny angles. Mirrors eval_policy.py:_goal_errors."""
+    Ra, Rb = _rotvec_to_mat(rvA), _rotvec_to_mat(rvB)
+    Rrel = Ra @ Rb.transpose(-1, -2)
+    tr = Rrel.diagonal(dim1=-2, dim2=-1).sum(-1)
+    cos = ((tr - 1.0) / 2.0).clamp(-1.0, 1.0)
+    return torch.rad2deg(torch.arccos(cos))
+
+
 def _csv_log_epoch(output_dir, epoch, global_step, step_log):
     """policy-training-pipeline: append per-epoch metrics to results.csv.
 
@@ -72,6 +97,10 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',
               'val_goal_pos_mm', 'val_goal_rot_deg',
+              'val_k1_pos_mm', 'val_k1_rot_deg',
+              'val_chunk_pos_mm', 'val_chunk_rot_deg',
+              'val_landing_pos_mm', 'val_landing_rot_deg',
+              'val_goalhead_pos_mm', 'val_select_mm',
               'lr', 'grad_norm', 'param_norm']
     row = {'epoch': epoch, 'global_step': global_step}
     for key in fields[2:]:
@@ -441,34 +470,104 @@ class TrainManiFlowRoboTwinWorkspace:
                         v_mse = torch.nn.functional.mse_loss(vres['action_pred'], vb['action'])
                         step_log['val_action_mse_error'] = v_mse.item()
 
-                    # Lumi v3: VAL-SPLIT GOAL ERROR over the FULL val split — the
-                    # deployment-meaningful landing metric and the checkpoint-selection signal.
-                    # Anchored actions => the LAST predicted chunk row is the endpoint; compare
-                    # it to the true goal-in-camera-frame label (batch['goal_cam'], 6-D). Own
-                    # loader with drop_last=False (predict_action has no consistency-NaN risk, so
-                    # partial batches are safe — avoids the main val loader's drop_last
-                    # starvation trap; independent of val_sampling_batch for the same reason).
-                    # Datasets without goal_cam (upstream robotwin) skip silently.
+                    # Lumi v7: VAL-SPLIT ACTION METRICS over the FULL val split — a suite of
+                    # deployment-meaningful, reproducible, horizon-honest signals, plus the
+                    # checkpoint-selection scalar. Own loader with drop_last=False (predict_action
+                    # has no consistency-NaN risk; avoids the main loader's drop_last starvation
+                    # trap). Datasets without goal_cam (upstream robotwin) skip silently.
+                    #
+                    # ROW SEMANTICS (anchored, same layout for action_pred and batch['action']):
+                    #   anchor_idx = To-1 is the ~0 anchor row; k1_idx = To is the FIRST future
+                    #   waypoint (the row a k=1 re-plan executes); [:, -1] is the chunk endpoint.
+                    #
+                    # WHY THIS REPLACES val_goal_pos_mm AS THE MONITOR KEY: the old key compared
+                    # the 16-step chunk endpoint to the EPISODE-FINAL goal_cam (up to ~44 steps
+                    # away), so for early anchors it measured "distance the horizon can't cover",
+                    # NOT model error — a saturated ~66mm geometry floor (std ~0.1mm over 300
+                    # epochs) => best.ckpt was argmin of noise. We now:
+                    #   - SEED the flow-sampling noise (predict_action draws torch.randn with
+                    #     generator=None) so every epoch/run sees the SAME noise => reproducible.
+                    #   - use a GEODESIC rotation error (not Euclidean rotvec diff).
+                    #   - select on val_select_mm = val_chunk_pos_mm + 10*val_chunk_rot_deg, a
+                    #     divergence-sensitive whole-future-chunk fidelity vs the GT anchored
+                    #     chunk (catches open-loop chunk drift, the historical B1 failure, which a
+                    #     k=1-only metric cannot see). 10 mm/deg matches the 5mm~=0.5deg target.
+                    #   - also log val_k1_* (deploy cadence) and a reach-gated val_landing_* (the
+                    #     endpoint-vs-goal_cam metric restricted to in-horizon windows, i.e. the
+                    #     horizon-honest slice of the old metric). val_goal_pos_mm kept for
+                    #     continuity but NO LONGER selected on.
                     if len(val_dataset) > 0:
-                        goal_pos_errs = []; goal_rot_errs = []
+                        # Reproducible val sampling WITHOUT contaminating the training RNG
+                        # stream: snapshot RNG, seed to a constant (same noise every epoch/run
+                        # => cross-epoch metrics comparable), then restore after the loop. Noise
+                        # is drawn on the model's CUDA device, so save/restore CUDA state too.
+                        _cpu_rng = torch.get_rng_state()
+                        _cuda_rng = (torch.cuda.get_rng_state_all()
+                                     if torch.cuda.is_available() else None)
+                        torch.manual_seed(int(cfg.training.seed))
+                        To = int(policy.n_obs_steps)
+                        k1_idx = To                                 # first future waypoint
+                        gp_e = []; gr_e = []            # old single-chunk endpoint vs goal_cam
+                        k1p_e = []; k1r_e = []          # k=1 deploy-cadence per-step
+                        chp_e = []; chr_e = []          # whole future-chunk fidelity vs GT
+                        lndp_e = []; lndr_e = []        # reach-gated landing (endpoint vs goal)
+                        ghp_e = []                      # goal-head (image->goal) pos error
                         val_goal_loader = DataLoader(
                             val_dataset, batch_size=cfg.val_dataloader.batch_size,
                             num_workers=0, shuffle=False, drop_last=False)
                         for gb in val_goal_loader:
                             if 'goal_cam' not in gb:
-                                goal_pos_errs = []
+                                gp_e = []
                                 break
                             gb = dict_apply(gb, lambda x: x.to(device, non_blocking=True))
-                            gpred = policy.predict_action(gb['obs'])['action_pred'][:, -1]  # (B,6) endpoint
-                            gt = gb['goal_cam']                                             # (B,6)
-                            goal_pos_errs.append(
-                                torch.linalg.norm(gpred[:, :3] - gt[:, :3], dim=1) * 1000.0)  # mm
-                            # small-angle rotvec difference — accurate proxy at these magnitudes
-                            goal_rot_errs.append(
-                                torch.rad2deg(torch.linalg.norm(gpred[:, 3:] - gt[:, 3:], dim=1)))  # deg
-                        if goal_pos_errs:
-                            step_log['val_goal_pos_mm'] = torch.cat(goal_pos_errs).mean().item()
-                            step_log['val_goal_rot_deg'] = torch.cat(goal_rot_errs).mean().item()
+                            gres = policy.predict_action(gb['obs'])
+                            pred = gres['action_pred']                               # (B,T,6)
+                            gt_a = gb['action']                                      # (B,T,6)
+                            goal = gb['goal_cam']                                    # (B,6)
+                            # goal-head image->goal error (horizon-independent), if trained
+                            if 'goal_pred' in gres:
+                                ghp_e.append(torch.linalg.norm(
+                                    gres['goal_pred'][:, :3] - goal[:, :3], dim=1) * 1000.0)
+                            end = pred[:, -1]                                        # (B,6) endpoint
+                            # (1) old single-chunk endpoint vs episode-final goal (continuity)
+                            gp_e.append(torch.linalg.norm(end[:, :3] - goal[:, :3], dim=1) * 1000.0)
+                            gr_e.append(_geodesic_deg(end[:, 3:], goal[:, 3:]))
+                            # (2) k=1 first-future-waypoint vs GT anchored row
+                            kp, kg = pred[:, k1_idx], gt_a[:, k1_idx]
+                            k1p_e.append(torch.linalg.norm(kp[:, :3] - kg[:, :3], dim=1) * 1000.0)
+                            k1r_e.append(_geodesic_deg(kp[:, 3:], kg[:, 3:]))
+                            # (3) whole future-chunk fidelity vs GT anchored chunk (rows To..end)
+                            fp, fg = pred[:, To:], gt_a[:, To:]                       # (B,R,6)
+                            chp_e.append((torch.linalg.norm(fp[..., :3] - fg[..., :3], dim=-1)
+                                          * 1000.0).reshape(-1))
+                            chr_e.append(_geodesic_deg(fp[..., 3:].reshape(-1, 3),
+                                                       fg[..., 3:].reshape(-1, 3)))
+                            # (4) reach-gated landing: windows whose GT endpoint already IS the
+                            # goal (goal within one horizon) => endpoint-vs-goal is honest there.
+                            reach = torch.linalg.norm(gt_a[:, -1, :3] - goal[:, :3], dim=1) < 1e-4
+                            if reach.any():
+                                lndp_e.append(torch.linalg.norm(
+                                    end[reach, :3] - goal[reach, :3], dim=1) * 1000.0)
+                                lndr_e.append(_geodesic_deg(end[reach, 3:], goal[reach, 3:]))
+                        if gp_e:
+                            step_log['val_goal_pos_mm'] = torch.cat(gp_e).mean().item()
+                            step_log['val_goal_rot_deg'] = torch.cat(gr_e).mean().item()
+                            step_log['val_k1_pos_mm'] = torch.cat(k1p_e).mean().item()
+                            step_log['val_k1_rot_deg'] = torch.cat(k1r_e).mean().item()
+                            step_log['val_chunk_pos_mm'] = torch.cat(chp_e).mean().item()
+                            step_log['val_chunk_rot_deg'] = torch.cat(chr_e).mean().item()
+                            # THE MONITOR KEY: divergence-sensitive, reproducible, non-structural
+                            step_log['val_select_mm'] = (step_log['val_chunk_pos_mm']
+                                                         + 10.0 * step_log['val_chunk_rot_deg'])
+                            if lndp_e:
+                                step_log['val_landing_pos_mm'] = torch.cat(lndp_e).mean().item()
+                                step_log['val_landing_rot_deg'] = torch.cat(lndr_e).mean().item()
+                            if ghp_e:
+                                step_log['val_goalhead_pos_mm'] = torch.cat(ghp_e).mean().item()
+                        # restore the training RNG stream (isolate val determinism)
+                        torch.set_rng_state(_cpu_rng)
+                        if _cuda_rng is not None:
+                            torch.cuda.set_rng_state_all(_cuda_rng)
 
             # run diffusion sampling on a training batch
             if (self.epoch % cfg.training.sample_every) == 0:

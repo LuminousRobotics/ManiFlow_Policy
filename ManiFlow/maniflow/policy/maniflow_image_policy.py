@@ -305,7 +305,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             'action': action,
             'action_pred': action_pred,
         }
-        
+        # Lumi v7: image-derived goal estimate, present iff the aux goal head was trained
+        # (goal_loss_weight>0). Torch-only — the ONNX wrapper reimplements inference inline
+        # and returns just (action, action_pred), so this never touches the export/gate. Used
+        # for the val_goalhead_pos_mm metric now and a deploy-time servo target later.
+        if getattr(self, 'goal_head', None) is not None and 'goal_cam' in self.normalizer.params_dict:
+            result['goal_pred'] = self.normalizer['goal_cam'].unnormalize(
+                self.goal_head(vis_cond.mean(dim=1)))
+
         return result
 
     # ========= training  ============
