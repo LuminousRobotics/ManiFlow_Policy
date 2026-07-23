@@ -52,8 +52,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             goal_loss_type="huber",            # "huber" | "mse"
             # --- Lumi C2: low-dim -> AdaLN-Zero routing (default OFF => stock v3 behaviour) ---
             lowdim_to_adaln=False,             # route prev_action/task into DiTX AdaLN instead of cross-attn tokens
-            proprio_mask_p=0.0,                # per-sample prob of zeroing prev_action during training (GAP/ManiFlow
+            proprio_mask_p=0.0,                # per-sample prob of masking prev_action during training (GAP/ManiFlow
                                                # proprio masking: keeps vision load-bearing for goal localization)
+            # --- v7 Rewire-MVP: training-only vision-forcing aux (default OFF => prior behaviour) ---
+            idm_loss_weight=0.0,               # lambda for the vision-only inverse-dynamics aux head (Huber)
             **kwargs):
         super().__init__()
 
@@ -179,10 +181,40 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.goal_loss_weight = float(goal_loss_weight)
         self.goal_loss_type = goal_loss_type
         if self.goal_loss_weight > 0.0:
+            # v7 Rewire: learned-query ATTENTION-POOL over visual tokens (replaces mean-pool)
+            # -> a spatially-localized goal readout. TRAINING ONLY; it shapes the SHARED
+            # encoder to localize the goal. Never conditions the actor, never in the ONNX
+            # signature (a torch-only goal_pred is exported for the val_goalhead diagnostic).
+            self.goal_query = nn.Parameter(torch.randn(1, 1, obs_feature_dim) * 0.02)
+            self.goal_attn = nn.MultiheadAttention(
+                obs_feature_dim, num_heads=4, batch_first=True)
             self.goal_head = nn.Sequential(
+                nn.LayerNorm(obs_feature_dim),
                 nn.Linear(obs_feature_dim, 256), nn.GELU(), nn.Linear(256, 6))
         else:
+            self.goal_query = None
+            self.goal_attn = None
             self.goal_head = None
+
+        # v7 Rewire: learned proprio MASK TOKEN (replaces masking-to-zero, since 0 is an
+        # in-distribution episode-start value the net can detect and ignore). Built only when
+        # proprio is routed to AdaLN. Init zeros => starts like the old zero-masking, then drifts.
+        if self.lowdim_to_adaln and self._pa_flat_dim > 0:
+            self.proprio_mask_token = nn.Parameter(torch.zeros(1, self._pa_flat_dim))
+        else:
+            self.proprio_mask_token = None
+
+        # v7 Rewire: vision-only INVERSE-DYNAMICS aux head. From the FIRST vs LAST obs-frame
+        # pooled visual tokens (NO prev_action) regress the most-recent inter-frame motion
+        # (the prev_action label) -> forces the eyes to encode motion, not just static goal.
+        # TRAINING ONLY.
+        self.idm_loss_weight = float(idm_loss_weight)
+        if self.idm_loss_weight > 0.0:
+            self.idm_head = nn.Sequential(
+                nn.LayerNorm(2 * obs_feature_dim),
+                nn.Linear(2 * obs_feature_dim, 256), nn.GELU(), nn.Linear(256, action_dim))
+        else:
+            self.idm_head = None
 
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
@@ -216,11 +248,23 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                  for k in self.lowdim_adaln_keys]
         cond = torch.cat(parts, dim=-1)
         if train_mask and self.proprio_mask_p > 0.0 and self._pa_flat_dim > 0:
-            keep = (torch.rand(batch_size, 1, device=cond.device)
-                    >= self.proprio_mask_p).to(cond.dtype)
-            cond = torch.cat([cond[:, :self._pa_flat_dim] * keep,
-                              cond[:, self._pa_flat_dim:]], dim=-1)
+            masked = (torch.rand(batch_size, 1, device=cond.device) < self.proprio_mask_p)
+            pa = cond[:, :self._pa_flat_dim]
+            if self.proprio_mask_token is not None:
+                tok = self.proprio_mask_token.to(cond.dtype).expand(batch_size, -1)
+                pa = torch.where(masked, tok, pa)                # learned mask token
+            else:
+                pa = pa * (~masked).to(cond.dtype)               # fallback: mask to zero
+            cond = torch.cat([pa, cond[:, self._pa_flat_dim:]], dim=-1)
         return cond
+
+    def _predict_goal(self, vis_cond):
+        """Attention-pool over the visual tokens -> normalized 6-D goal in the camera frame.
+        Used by the training-only goal aux loss AND the torch-only goal_pred diagnostic; it
+        NEVER conditions the actor and is NEVER in the ONNX signature."""
+        q = self.goal_query.expand(vis_cond.shape[0], -1, -1)    # (B,1,Do) learned query
+        pooled, _ = self.goal_attn(q, vis_cond, vis_cond)        # (B,1,Do)
+        return self.goal_head(pooled.squeeze(1))                 # (B,6)
 
     def conditional_sample(self,
             condition_data,
@@ -311,7 +355,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # for the val_goalhead_pos_mm metric now and a deploy-time servo target later.
         if getattr(self, 'goal_head', None) is not None and 'goal_cam' in self.normalizer.params_dict:
             result['goal_pred'] = self.normalizer['goal_cam'].unnormalize(
-                self.goal_head(vis_cond.mean(dim=1)))
+                self._predict_goal(vis_cond))
 
         return result
 
@@ -680,7 +724,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         loss_goal = 0.0
         if self.goal_head is not None and 'goal_cam' in batch:
             goal_norm = self.normalizer['goal_cam'].normalize(batch['goal_cam']).to(self.device)
-            goal_pred = self.goal_head(vis_cond.mean(dim=1))                      # (B,6)
+            goal_pred = self._predict_goal(vis_cond)                             # (B,6) attn-pool
             if self.goal_loss_type == "mse":
                 gl = F.mse_loss(goal_pred, goal_norm)
             else:
@@ -688,12 +732,33 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             loss = loss + self.goal_loss_weight * gl
             loss_goal = gl.item()
 
+        # --- v7 Rewire: vision-only inverse-dynamics aux (training-only encoder regularizer) ---
+        # Predict the most-recent inter-frame motion (prev_action label) from the FIRST vs LAST
+        # obs-frame pooled visual tokens ONLY (no prev_action input) -> the motion signal that
+        # proprio monopolizes is forced INTO the vision path.
+        loss_idm = 0.0
+        if self.idm_head is not None and 'prev_action' in nobs:
+            To = self.n_obs_steps
+            Lc = vis_cond.shape[1]
+            if Lc % To == 0:
+                Lg = Lc // To
+                f_first = vis_cond[:, :Lg].mean(dim=1)                            # (B,Do) frame 0
+                f_last = vis_cond[:, (To - 1) * Lg: To * Lg].mean(dim=1)          # (B,Do) frame To-1
+            else:
+                f_first = f_last = vis_cond.mean(dim=1)
+            idm_pred = self.idm_head(torch.cat([f_first, f_last], dim=-1))        # (B,Da)
+            idm_tgt = nobs['prev_action'][:, To - 1].to(self.device)             # (B,Da) recent motion
+            li = F.smooth_l1_loss(idm_pred, idm_tgt)
+            loss = loss + self.idm_loss_weight * li
+            loss_idm = li.item()
+
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
                 'loss_endpoint': loss_endpoint,
                 'loss_goal': loss_goal,
+                'loss_idm': loss_idm,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),

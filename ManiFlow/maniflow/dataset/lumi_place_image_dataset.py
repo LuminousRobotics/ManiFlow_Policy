@@ -53,6 +53,10 @@ DEFAULT_AUGMENTATION = {
     "prev_action_noise_mm": 0.5,     # gaussian on prev_action translation [mm]
     "prev_action_noise_deg": 0.05,   # gaussian on prev_action rotvec [deg]
     "latency_shift_prob": 0.5,       # per-episode prob a stream lags 1 control tick
+    "rot_aug_deg": 0.0,              # v7 Rewire: SO(2) optical-axis roll aug half-range [deg]; 0 => off
+    "photo_brightness": 0.0,         # v7 Rewire: +/- brightness/contrast jitter fraction; 0 => off
+    "photo_noise": 0.0,              # v7 Rewire: gaussian pixel noise std (image in [0,1]); 0 => off
+    "photo_erase_p": 0.0,            # v7 Rewire: prob of a random-erasing box; 0 => off
 }
 
 
@@ -194,6 +198,10 @@ class LumiPlaceImageDataset(BaseDataset):
             aug.update({k: v for k, v in dict(augmentation).items() if v is not None})
         self.aug = aug
         self.augment = bool(aug.get("enable", True))
+        self.rot_aug_deg = float(aug.get("rot_aug_deg", 0.0))
+        self.photo_brightness = float(aug.get("photo_brightness", 0.0))
+        self.photo_noise = float(aug.get("photo_noise", 0.0))
+        self.photo_erase_p = float(aug.get("photo_erase_p", 0.0))
         self._episode_ends = self.replay_buffer.episode_ends[:]
 
         self.zarr_path = zarr_path
@@ -270,6 +278,56 @@ class LumiPlaceImageDataset(BaseDataset):
         out = np.clip(meters * 1000.0, 0.0, 65535.0)
         out[~valid | drop] = 0.0
         return out.astype(np.float32)  # keep float mm for the encode step
+
+    def _augment_photometric(self, head_cam, rng):
+        """v7 Rewire: label-safe RGB appearance aug (train-only) — per-sample brightness/
+        contrast jitter, gaussian pixel noise, and random-erasing. Same box/factor across the
+        To frames (a single physical scene). head_cam is (T,3,S,S) in [0,1]."""
+        hc = head_cam
+        if self.photo_brightness > 0.0:
+            b = float(rng.uniform(1.0 - self.photo_brightness, 1.0 + self.photo_brightness))
+            m = hc.mean()
+            hc = np.clip(m + (hc - m) * b, 0.0, 1.0)          # contrast/brightness about the mean
+        if self.photo_noise > 0.0:
+            hc = np.clip(hc + rng.normal(0.0, self.photo_noise, hc.shape).astype(np.float32), 0.0, 1.0)
+        if self.photo_erase_p > 0.0 and rng.random() < self.photo_erase_p:
+            S = hc.shape[-1]
+            eh = int(S * rng.uniform(0.05, 0.20)); ew = int(S * rng.uniform(0.05, 0.20))
+            y0 = int(rng.integers(0, max(1, S - eh + 1))); x0 = int(rng.integers(0, max(1, S - ew + 1)))
+            hc = hc.copy()
+            hc[..., y0:y0 + eh, x0:x0 + ew] = float(rng.uniform(0.0, 1.0))
+        return hc.astype(np.float32)
+
+    def _augment_so2(self, head_cam, depth_mm, action, goal_cam, prev_action, rng):
+        """v7 Rewire: label-consistent SO(2) optical-axis roll. Rotate the wrist image
+        (+depth if present) in-plane by phi about center, and CO-ROTATE the camera-frame
+        6-D labels [pos|rotvec] by R_z(SO2_SIGN*phi). Multiplies the manifold along the
+        task's real roll symmetry -> anti-overfit + RGB-roll robustness. SO2_SIGN=-1 was
+        pinned empirically: torchvision TF.rotate(+phi_deg) == camera R_z(-phi) for a
+        centered pinhole (scratchpad/so2_sign_test.py, sub-pixel match)."""
+        import torchvision.transforms.functional as TF
+        phi_deg = float(rng.uniform(-self.rot_aug_deg, self.rot_aug_deg))
+        if abs(phi_deg) < 1e-3:
+            return head_cam, depth_mm, action, goal_cam, prev_action
+        # images: rotate the last two dims (H,W); leading (T,C) treated as batch. Bilinear
+        # for RGB; nearest for depth (avoid interpolating across the invalid/glass boundary).
+        hc = TF.rotate(torch.from_numpy(head_cam), angle=phi_deg,
+                       interpolation=TF.InterpolationMode.BILINEAR).numpy()
+        dm = depth_mm
+        if depth_mm is not None:
+            dm = TF.rotate(torch.from_numpy(depth_mm), angle=phi_deg,
+                           interpolation=TF.InterpolationMode.NEAREST).numpy()
+        # labels: v' = R_z(-phi) @ v  for BOTH pos (rows :3) and rotvec (rows 3:)
+        a = np.radians(-phi_deg)     # SO2_SIGN = -1
+        ca, sa = np.cos(a), np.sin(a)
+        Rz_T = np.array([[ca, sa, 0.0], [-sa, ca, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)  # R_z(a).T
+
+        def _co(arr):                # arr: (...,6) -> co-rotate pos & rotvec by R_z(a) (== arr @ R_z(a).T)
+            out = arr.copy()
+            out[..., :3] = arr[..., :3] @ Rz_T
+            out[..., 3:] = arr[..., 3:] @ Rz_T
+            return out
+        return hc, dm, _co(action), _co(goal_cam), _co(prev_action)
 
     def _augment_prev_action(self, pa, sample_rng):
         pa = pa.copy()
@@ -348,6 +406,7 @@ class LumiPlaceImageDataset(BaseDataset):
             sample['tcp_pos_w'], sample['tcp_quat_w'], sample['cam_quat_cv'], anchor)
         goal_cam = np.concatenate(
             [sample['goal_pos_cam'][anchor], sample['goal_rot_cam'][anchor]]).astype(np.float32)
+        head_cam = sample['head_camera'][:, ].astype(np.float32) / 255.0
 
         if self.augment and ep_idx is not None:
             ep_rng = np.random.default_rng([self.seed, 1000003, ep_idx])
@@ -363,8 +422,14 @@ class LumiPlaceImageDataset(BaseDataset):
             # different sensor path with real latency) keeps the lag augmentation.
             if lat_rng.random() < p:
                 prev_action = self._lag_one_tick(prev_action)
+            # v7 Rewire: SO(2) optical-axis roll co-rotates image + camera-frame labels
+            if self.rot_aug_deg > 0.0:
+                head_cam, depth_mm, action, goal_cam, prev_action = self._augment_so2(
+                    head_cam, depth_mm, action, goal_cam, prev_action, sample_rng)
+            # v7 Rewire: RGB appearance aug (train-only; keeps eval obs clean)
+            if self.photo_brightness > 0.0 or self.photo_noise > 0.0 or self.photo_erase_p > 0.0:
+                head_cam = self._augment_photometric(head_cam, sample_rng)
 
-        head_cam = sample['head_camera'][:, ].astype(np.float32) / 255.0
         obs = {
             'head_cam': head_cam,
             'prev_action': prev_action,
