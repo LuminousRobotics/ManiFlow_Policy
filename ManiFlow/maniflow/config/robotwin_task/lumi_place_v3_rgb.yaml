@@ -43,3 +43,12 @@ dataset:
     prev_action_noise_mm: 0.5
     prev_action_noise_deg: 0.05
     latency_shift_prob: 0.5
+    # v7 Rewire schema (default OFF; set per-run via training_config -> AUG_KEYS overrides)
+    rot_aug_deg: 0.0
+    photo_brightness: 0.0
+    photo_contrast: 0.0
+    photo_saturation: 0.0
+    photo_hue: 0.0
+    photo_blur_p: 0.0
+    photo_noise: 0.0
+    photo_erase_p: 0.0
