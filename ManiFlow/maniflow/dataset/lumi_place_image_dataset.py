@@ -54,9 +54,15 @@ DEFAULT_AUGMENTATION = {
     "prev_action_noise_deg": 0.05,   # gaussian on prev_action rotvec [deg]
     "latency_shift_prob": 0.5,       # per-episode prob a stream lags 1 control tick
     "rot_aug_deg": 0.0,              # v7 Rewire: SO(2) optical-axis roll aug half-range [deg]; 0 => off
-    "photo_brightness": 0.0,         # v7 Rewire: +/- brightness/contrast jitter fraction; 0 => off
-    "photo_noise": 0.0,              # v7 Rewire: gaussian pixel noise std (image in [0,1]); 0 => off
-    "photo_erase_p": 0.0,            # v7 Rewire: prob of a random-erasing box; 0 => off
+    # v7 Rewire: label-safe RGB appearance aug (train-only; all 0 => off). Photometric only —
+    # no geometry change, so no label co-rotation needed. Per-sample, same across the To frames.
+    "photo_brightness": 0.0,         # brightness jitter fraction (torchvision adjust_brightness)
+    "photo_contrast": 0.0,           # contrast jitter fraction
+    "photo_saturation": 0.0,         # saturation jitter fraction
+    "photo_hue": 0.0,                # hue jitter (+/-, in [0,0.5])
+    "photo_blur_p": 0.0,             # prob of a mild gaussian blur
+    "photo_noise": 0.0,              # gaussian pixel noise std (image in [0,1])
+    "photo_erase_p": 0.0,            # prob of a random-erasing box (up to 2 boxes)
 }
 
 
@@ -200,6 +206,10 @@ class LumiPlaceImageDataset(BaseDataset):
         self.augment = bool(aug.get("enable", True))
         self.rot_aug_deg = float(aug.get("rot_aug_deg", 0.0))
         self.photo_brightness = float(aug.get("photo_brightness", 0.0))
+        self.photo_contrast = float(aug.get("photo_contrast", 0.0))
+        self.photo_saturation = float(aug.get("photo_saturation", 0.0))
+        self.photo_hue = float(aug.get("photo_hue", 0.0))
+        self.photo_blur_p = float(aug.get("photo_blur_p", 0.0))
         self.photo_noise = float(aug.get("photo_noise", 0.0))
         self.photo_erase_p = float(aug.get("photo_erase_p", 0.0))
         self._episode_ends = self.replay_buffer.episode_ends[:]
@@ -280,22 +290,43 @@ class LumiPlaceImageDataset(BaseDataset):
         return out.astype(np.float32)  # keep float mm for the encode step
 
     def _augment_photometric(self, head_cam, rng):
-        """v7 Rewire: label-safe RGB appearance aug (train-only) — per-sample brightness/
-        contrast jitter, gaussian pixel noise, and random-erasing. Same box/factor across the
-        To frames (a single physical scene). head_cam is (T,3,S,S) in [0,1]."""
-        hc = head_cam
+        """v7 Rewire: label-safe RGB appearance aug (train-only). Photometric only (no geometry
+        change => no label co-rotation). Per-sample, SAME factor/box across the To frames (a
+        single physical scene). Order: color jitter (brightness/contrast/saturation/hue) ->
+        gaussian blur -> gaussian noise -> random erasing. head_cam is (T,3,S,S) in [0,1].
+        Targets lighting/reflectance/optical robustness — the specular RGB-variation the model
+        must generalize over."""
+        import torchvision.transforms.functional as TF
+        t = torch.from_numpy(head_cam)                                   # (T,3,S,S) in [0,1]
+        # ---- color jitter (torchvision), random factor once, applied to all frames ----
         if self.photo_brightness > 0.0:
-            b = float(rng.uniform(1.0 - self.photo_brightness, 1.0 + self.photo_brightness))
-            m = hc.mean()
-            hc = np.clip(m + (hc - m) * b, 0.0, 1.0)          # contrast/brightness about the mean
+            t = TF.adjust_brightness(t, float(rng.uniform(1 - self.photo_brightness, 1 + self.photo_brightness)))
+        if self.photo_contrast > 0.0:
+            t = TF.adjust_contrast(t, float(rng.uniform(1 - self.photo_contrast, 1 + self.photo_contrast)))
+        if self.photo_saturation > 0.0:
+            t = TF.adjust_saturation(t, float(rng.uniform(1 - self.photo_saturation, 1 + self.photo_saturation)))
+        if self.photo_hue > 0.0:
+            h = float(rng.uniform(-self.photo_hue, self.photo_hue))
+            t = TF.adjust_hue(t.clamp(0.0, 1.0), max(-0.5, min(0.5, h)))
+        # ---- mild gaussian blur (optical defocus / motion) ----
+        if self.photo_blur_p > 0.0 and rng.random() < self.photo_blur_p:
+            sigma = float(rng.uniform(0.4, 1.2))
+            t = TF.gaussian_blur(t, kernel_size=5, sigma=sigma)
+        hc = t.numpy()
+        # ---- gaussian pixel noise (sensor) ----
         if self.photo_noise > 0.0:
-            hc = np.clip(hc + rng.normal(0.0, self.photo_noise, hc.shape).astype(np.float32), 0.0, 1.0)
-        if self.photo_erase_p > 0.0 and rng.random() < self.photo_erase_p:
-            S = hc.shape[-1]
-            eh = int(S * rng.uniform(0.05, 0.20)); ew = int(S * rng.uniform(0.05, 0.20))
-            y0 = int(rng.integers(0, max(1, S - eh + 1))); x0 = int(rng.integers(0, max(1, S - ew + 1)))
+            hc = hc + rng.normal(0.0, self.photo_noise, hc.shape).astype(np.float32)
+        hc = np.clip(hc, 0.0, 1.0)
+        # ---- random erasing (occlusion / glare patch): up to 2 boxes, filled with random gray ----
+        if self.photo_erase_p > 0.0:
             hc = hc.copy()
-            hc[..., y0:y0 + eh, x0:x0 + ew] = float(rng.uniform(0.0, 1.0))
+            S = hc.shape[-1]
+            for _ in range(2):
+                if rng.random() >= self.photo_erase_p:
+                    continue
+                eh = int(S * rng.uniform(0.05, 0.20)); ew = int(S * rng.uniform(0.05, 0.20))
+                y0 = int(rng.integers(0, max(1, S - eh + 1))); x0 = int(rng.integers(0, max(1, S - ew + 1)))
+                hc[..., y0:y0 + eh, x0:x0 + ew] = float(rng.uniform(0.0, 1.0))
         return hc.astype(np.float32)
 
     def _augment_so2(self, head_cam, depth_mm, action, goal_cam, prev_action, rng):
@@ -427,7 +458,9 @@ class LumiPlaceImageDataset(BaseDataset):
                 head_cam, depth_mm, action, goal_cam, prev_action = self._augment_so2(
                     head_cam, depth_mm, action, goal_cam, prev_action, sample_rng)
             # v7 Rewire: RGB appearance aug (train-only; keeps eval obs clean)
-            if self.photo_brightness > 0.0 or self.photo_noise > 0.0 or self.photo_erase_p > 0.0:
+            if any(v > 0.0 for v in (self.photo_brightness, self.photo_contrast,
+                                     self.photo_saturation, self.photo_hue, self.photo_blur_p,
+                                     self.photo_noise, self.photo_erase_p)):
                 head_cam = self._augment_photometric(head_cam, sample_rng)
 
         obs = {
