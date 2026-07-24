@@ -164,6 +164,11 @@ class LumiPlaceImageDataset(BaseDataset):
                        'goal_rot_cam', 'task']
         if self.use_depth:
             buffer_keys.insert(1, 'depth')
+        # F-series: load rail/tube keypoint targets if the zarr has them (v8+; back-compat with v7).
+        _zk = set(zarr.open(str(zarr_path), mode='r')['data'].keys())
+        for _k in ('arm_kpts_uv', 'arm_kpts_cam'):
+            if _k in _zk:
+                buffer_keys.append(_k)
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=buffer_keys)
 
         # C2 "xyz" point-map mode: unproject each depth pixel to metric camera-frame
