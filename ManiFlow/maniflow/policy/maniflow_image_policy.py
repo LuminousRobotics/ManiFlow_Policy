@@ -56,6 +56,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                                                # proprio masking: keeps vision load-bearing for goal localization)
             # --- v7 Rewire-MVP: training-only vision-forcing aux (default OFF => prior behaviour) ---
             idm_loss_weight=0.0,               # lambda for the vision-only inverse-dynamics aux head (Huber)
+            # --- F-series: soft-argmax keypoint head + self-predicted goal token ON the actor path ---
+            kpt_loss_weight=0.0,               # lambda for rail/tube keypoint soft-argmax head; 0 => no F heads
+            place_loss_weight=0.0,             # lambda for keypoint->place-pose regression (vs goal_cam)
+            n_keypoints=7,                     # converter N_KEYPOINTS (rail samples + tube)
             **kwargs):
         super().__init__()
 
@@ -216,6 +220,50 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         else:
             self.idm_head = None
 
+        # --- F-series: soft-argmax keypoint head + self-predicted goal TOKEN (ON the actor path) ---
+        # Reads the dense visual feature map -> N rail/tube keypoints (soft-argmax, sub-pixel); a small
+        # MLP derives the place pose (6-D camera frame); a projection makes it ONE extra cross-attn
+        # token appended to vis_cond. The actor's delta is generated TOWARD the self-predicted goal, so
+        # the action loss backprops THROUGH the keypoints into the shared encoder -> vision becomes
+        # load-bearing by construction. Keypoints supervised by projected-GT arm_kpts_uv (visibility-
+        # masked); place pose by goal_cam. Self-predicted only (never the GT goal as the token).
+        self.kpt_loss_weight = float(kpt_loss_weight)
+        self.place_loss_weight = float(place_loss_weight)
+        self.n_keypoints = int(n_keypoints)
+        if self.kpt_loss_weight > 0.0:
+            from maniflow.model.vision_2d.soft_argmax import SoftArgmaxKeypointHead
+            ds = int(getattr(obs_encoder, 'downsample_ratio', 32))
+            img_hw = int(obs_shape_meta['head_cam']['shape'][-1])
+            self._kpt_grid = max(1, img_hw // ds)                       # 224 // 32 = 7
+            self.kpt_head = SoftArgmaxKeypointHead(obs_feature_dim, self.n_keypoints)
+            self.goal_from_kpts = nn.Sequential(                        # [u,v,conf]*N -> place pose
+                nn.LayerNorm(self.n_keypoints * 3),
+                nn.Linear(self.n_keypoints * 3, 256), nn.GELU(), nn.Linear(256, 6))
+            self.goal_token_proj = nn.Sequential(                      # place pose -> conditioning token
+                nn.Linear(6, obs_feature_dim), nn.GELU(),
+                nn.Linear(obs_feature_dim, obs_feature_dim))
+            cprint(f"[F-series] soft-argmax keypoint head: {self.n_keypoints} kpts on a "
+                   f"{self._kpt_grid}x{self._kpt_grid} grid -> place-pose goal token "
+                   f"(kpt_w={self.kpt_loss_weight} place_w={self.place_loss_weight})", "green")
+        else:
+            self.kpt_head = None
+            self.goal_from_kpts = None
+            self.goal_token_proj = None
+
+    def _kpt_and_goal(self, vis_cond, To):
+        """Slice the most-recent visual frame's tokens from vis_cond (visual tokens come FIRST,
+        row-major), reshape to (B,D,g,g), run the soft-argmax head -> keypoints (B,N,2) + presence
+        (B,N) -> place pose (B,6) -> goal token (B,1,D). Returns (uv, conf, place, goal_token)."""
+        B = vis_cond.shape[0]; D = vis_cond.shape[-1]
+        g = self._kpt_grid; Lg = g * g
+        vis = vis_cond[:, (To - 1) * Lg: To * Lg, :]                    # (B, Lg, D) most-recent frame
+        fmap = vis.transpose(1, 2).reshape(B, D, g, g)                  # (B, D, g, g)
+        uv, conf = self.kpt_head(fmap)                                 # (B,N,2), (B,N)
+        kp_feat = torch.cat([uv, torch.sigmoid(conf).unsqueeze(-1)], dim=-1).reshape(B, -1)
+        place = self.goal_from_kpts(kp_feat)                           # (B,6) normalized place pose
+        goal_token = self.goal_token_proj(place).unsqueeze(1)          # (B,1,D)
+        return uv, conf, place, goal_token
+
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
@@ -322,6 +370,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
         nobs_features = self.obs_encoder(this_nobs).to(device)
         vis_cond = nobs_features.reshape(B, -1, Do) # B, self.n_obs_steps*L, Do
+        if self.kpt_head is not None:                # F-series: append self-predicted goal token
+            _, _, _, _goal_tok = self._kpt_and_goal(vis_cond, To)
+            vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
         # Lumi C2: compact control conditioning for AdaLN (no masking at inference)
         lowdim_cond = self._build_lowdim_cond(nobs, B, To, device)
         # empty data for action
@@ -640,6 +691,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             lambda x: x[:,:self.n_obs_steps,...].to(self.device))
         nobs_features = self.obs_encoder(this_nobs)
         vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
+        # F-series: self-predicted goal token appended to the visual conditioning (actor path).
+        # Gradient from the action loss flows through the goal token -> keypoints -> encoder.
+        f_uv = f_conf = f_place = None
+        if self.kpt_head is not None:
+            f_uv, f_conf, f_place, _goal_tok = self._kpt_and_goal(vis_cond, self.n_obs_steps)
+            vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
         # Lumi C2: AdaLN control conditioning; proprio masking active in training only
         lowdim_cond = self._build_lowdim_cond(
             nobs, batch_size, self.n_obs_steps, self.device, train_mask=self.training)
@@ -752,6 +809,21 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             loss = loss + self.idm_loss_weight * li
             loss_idm = li.item()
 
+        # --- F-series: soft-argmax keypoint loss (vis-masked) + place-pose regression loss ---
+        loss_kpt = 0.0
+        loss_place = 0.0
+        if self.kpt_head is not None and f_uv is not None and 'arm_kpts_uv' in batch:
+            from maniflow.model.vision_2d.soft_argmax import keypoint_loss
+            gt = batch['arm_kpts_uv'][:, self.n_obs_steps - 1].to(self.device)   # (B,N,3) recent obs frame
+            lk_pos, lk_pres = keypoint_loss(f_uv, f_conf, gt[..., :2], gt[..., 2])
+            loss = loss + self.kpt_loss_weight * (lk_pos + lk_pres)
+            loss_kpt = float((lk_pos + lk_pres).item())
+            if self.place_loss_weight > 0.0 and 'goal_cam' in batch:
+                goal_norm = self.normalizer['goal_cam'].normalize(batch['goal_cam']).to(self.device)
+                lpl = F.smooth_l1_loss(f_place, goal_norm)
+                loss = loss + self.place_loss_weight * lpl
+                loss_place = float(lpl.item())
+
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
@@ -759,6 +831,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'loss_endpoint': loss_endpoint,
                 'loss_goal': loss_goal,
                 'loss_idm': loss_idm,
+                'loss_kpt': loss_kpt,
+                'loss_place': loss_place,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),

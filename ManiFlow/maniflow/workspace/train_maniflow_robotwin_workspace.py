@@ -94,7 +94,7 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
     fields = ['epoch', 'global_step',
               'train_loss', 'val_loss', 'bc_loss',
               'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
-              'loss_endpoint', 'loss_goal', 'loss_idm',
+              'loss_endpoint', 'loss_goal', 'loss_idm', 'loss_kpt', 'loss_place',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',
               'val_goal_pos_mm', 'val_goal_rot_deg',
@@ -315,6 +315,8 @@ class TrainManiFlowRoboTwinWorkspace:
         _gpu_aug = None
         if bool(cfg.get('gpu_augment', False)):
             _gpu_aug = OmegaConf.to_container(cfg.robotwin_task.dataset.augmentation, resolve=True)
+            # F-series: normalized intrinsics so the aug can RE-PROJECT rotated keypoints (SO(2)).
+            _gpu_aug['cam_k_norm'] = getattr(dataset, 'cam_k_norm', None)
             cprint(f"[GPU-AUG] on-device batch aug: rot_aug_deg={_gpu_aug.get('rot_aug_deg')} "
                    f"photo(b/c/s/h)={_gpu_aug.get('photo_brightness')}/{_gpu_aug.get('photo_contrast')}/"
                    f"{_gpu_aug.get('photo_saturation')}/{_gpu_aug.get('photo_hue')} "

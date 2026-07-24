@@ -183,6 +183,19 @@ class LumiPlaceImageDataset(BaseDataset):
             self._xmap = ((uu - cx) / fx).astype(np.float32)
             self._ymap = ((vv - cy) / fy).astype(np.float32)
 
+        # F-series: normalized intrinsics [fx/W, fy/H, cx/W, cy/H] for re-projecting rotated
+        # keypoints under GPU SO(2) aug. camera_K is stored at resolution S and the converter
+        # normalized arm_kpts_uv by full-res (u/W == u_stored/S), so cam_k_norm = camera_K / S.
+        self.cam_k_norm = None
+        try:
+            _K = np.asarray(zarr.open(str(zarr_path), mode='r')['meta']['camera_K'][:],
+                            dtype=np.float64).reshape(-1)
+            _S = float(self.replay_buffer['head_camera'].shape[-1])
+            self.cam_k_norm = [float(_K[0] / _S), float(_K[1] / _S),
+                               float(_K[2] / _S), float(_K[3] / _S)]
+        except Exception:
+            self.cam_k_norm = None
+
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes, val_ratio=val_ratio, seed=seed)
         train_mask = ~val_mask
@@ -481,11 +494,17 @@ class LumiPlaceImageDataset(BaseDataset):
             self._check_depth_channels(depth_cam)
             obs['depth_cam'] = depth_cam
 
-        return {
+        out = {
             'obs': obs,
             'action': action,
             'goal_cam': goal_cam,       # supervision only; NOT in obs / ONNX
         }
+        # F-series: rail/tube keypoints (v8 zarr) for the soft-argmax head. Full window; the
+        # policy uses the most-recent obs frame. NOT in obs/ONNX (targets + goal-token source).
+        if 'arm_kpts_uv' in sample:
+            out['arm_kpts_uv'] = sample['arm_kpts_uv'][:].astype(np.float32)   # (T,N,3) [u/W,v/H,vis]
+            out['arm_kpts_cam'] = sample['arm_kpts_cam'][:].astype(np.float32)  # (T,N,3) [Xc,Yc,Zc]
+        return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
