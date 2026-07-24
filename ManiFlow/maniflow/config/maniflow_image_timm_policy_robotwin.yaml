@@ -15,6 +15,11 @@ dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
 obs_as_global_cond: true
 
+# Lumi v7: run SO(2)+photometric augmentation on the CUDA batch in the train loop instead of
+# per-sample on the CPU DataLoader workers (frees the L40S). Pair with
+# robotwin_task.dataset.augmentation.gpu_offload=true so the dataset skips its own SO(2)/photometric.
+gpu_augment: false
+
 policy:
   _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
   block_type: "DiTX"

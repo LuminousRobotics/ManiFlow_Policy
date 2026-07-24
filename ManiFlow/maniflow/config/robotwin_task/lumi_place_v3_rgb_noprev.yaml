@@ -1,24 +1,22 @@
-# Lumi place-policy C2 CONTROL arm — RGB-ONLY (no depth stream at all).
-# Selected at launch via: robotwin_task=lumi_place_v3_rgb
+# Lumi place-policy E1 arm — RGB-ONLY, prev_action REMOVED from obs (copycat channel killed).
+# Selected at launch via: robotwin_task=lumi_place_v3_rgb_noprev
 #
-# Purpose: settle "do we need depth?" with a controlled ablation. Evidence pointing at
-# RGB-only being competitive: DP3's ablation had RGB-D-as-images BELOW plain RGB; the
-# v0.1.4 model already trained with depth episode-dropped 40% of the time (so its
-# performance is largely depth-free); and depth sensors fail on the specular panel glass.
-# If this arm ties C2-xyz on success@15mm, the depth trunk is dead weight (faster train
-# + inference); if xyz wins, metric geometry earns its place.
+# Identical to lumi_place_v3_rgb EXCEPT prev_action is dropped from shape_meta.obs, so the
+# encoder never sees it and phase/motion must be read from the 2 RGB frames. The dataset still
+# emits prev_action (harmless): it is used only to fit the normalizer and (if idm_loss_weight>0)
+# as the vision-only inverse-dynamics TARGET — never as a model input. Rationale (docs/
+# rgb_attention_redesign.md, Stage B / arm E1): PAR≈0 at proprio_mask_p=0.5 says the network
+# barely uses prev_action; anchored chunks can execute the short J6 blind tail open-loop. The
+# E0(keep)↔E1(drop) free-running delta is the definitive test of whether killing the copycat
+# channel makes RGB load-bearing on this fixed dataset.
 
-name: lumi_place_v3_rgb
+name: lumi_place_v3_rgb_noprev
 
 shape_meta:
   obs:
     head_cam:
       shape: [3, 224, 224]
       type: rgb
-      horizon: ${n_obs_steps}
-    prev_action:
-      shape: [6]               # previous-step executed camera-frame delta (row0 = zeros)
-      type: low_dim
       horizon: ${n_obs_steps}
     task:
       shape: [1]               # [neighbor_present]

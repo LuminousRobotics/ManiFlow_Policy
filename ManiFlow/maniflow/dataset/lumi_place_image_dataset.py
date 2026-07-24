@@ -54,6 +54,8 @@ DEFAULT_AUGMENTATION = {
     "prev_action_noise_deg": 0.05,   # gaussian on prev_action rotvec [deg]
     "latency_shift_prob": 0.5,       # per-episode prob a stream lags 1 control tick
     "rot_aug_deg": 0.0,              # v7 Rewire: SO(2) optical-axis roll aug half-range [deg]; 0 => off
+    "gpu_offload": False,            # v7 GPU-aug: skip CPU SO(2)+photometric here (workspace does it on
+                                     # the CUDA batch instead); prev_action noise + latency lag stay on CPU
     # v7 Rewire: label-safe RGB appearance aug (train-only; all 0 => off). Photometric only —
     # no geometry change, so no label co-rotation needed. Per-sample, same across the To frames.
     "photo_brightness": 0.0,         # brightness jitter fraction (torchvision adjust_brightness)
@@ -212,6 +214,9 @@ class LumiPlaceImageDataset(BaseDataset):
         self.photo_blur_p = float(aug.get("photo_blur_p", 0.0))
         self.photo_noise = float(aug.get("photo_noise", 0.0))
         self.photo_erase_p = float(aug.get("photo_erase_p", 0.0))
+        # v7 GPU-aug: when true, SO(2) roll + photometric are done on the CUDA batch in the
+        # training loop (maniflow.model.vision_2d.gpu_augment), NOT here per-sample on the CPU.
+        self.gpu_offload = bool(aug.get("gpu_offload", False))
         self._episode_ends = self.replay_buffer.episode_ends[:]
 
         self.zarr_path = zarr_path
@@ -453,15 +458,18 @@ class LumiPlaceImageDataset(BaseDataset):
             # different sensor path with real latency) keeps the lag augmentation.
             if lat_rng.random() < p:
                 prev_action = self._lag_one_tick(prev_action)
-            # v7 Rewire: SO(2) optical-axis roll co-rotates image + camera-frame labels
-            if self.rot_aug_deg > 0.0:
-                head_cam, depth_mm, action, goal_cam, prev_action = self._augment_so2(
-                    head_cam, depth_mm, action, goal_cam, prev_action, sample_rng)
-            # v7 Rewire: RGB appearance aug (train-only; keeps eval obs clean)
-            if any(v > 0.0 for v in (self.photo_brightness, self.photo_contrast,
-                                     self.photo_saturation, self.photo_hue, self.photo_blur_p,
-                                     self.photo_noise, self.photo_erase_p)):
-                head_cam = self._augment_photometric(head_cam, sample_rng)
+            # v7 Rewire: SO(2) optical-axis roll co-rotates image + camera-frame labels.
+            # When gpu_offload is set, the workspace does SO(2)+photometric on the CUDA batch
+            # instead (this per-sample CPU path is skipped to avoid double-augmenting).
+            if not self.gpu_offload:
+                if self.rot_aug_deg > 0.0:
+                    head_cam, depth_mm, action, goal_cam, prev_action = self._augment_so2(
+                        head_cam, depth_mm, action, goal_cam, prev_action, sample_rng)
+                # v7 Rewire: RGB appearance aug (train-only; keeps eval obs clean)
+                if any(v > 0.0 for v in (self.photo_brightness, self.photo_contrast,
+                                         self.photo_saturation, self.photo_hue, self.photo_blur_p,
+                                         self.photo_noise, self.photo_erase_p)):
+                    head_cam = self._augment_photometric(head_cam, sample_rng)
 
         obs = {
             'head_cam': head_cam,

@@ -51,6 +51,7 @@ from maniflow.common.checkpoint_util import TopKCheckpointManager
 from maniflow.common.pytorch_util import dict_apply, optimizer_to
 from maniflow.model.diffusion.ema_model import EMAModel
 from maniflow.model.common.lr_scheduler import get_scheduler
+from maniflow.model.vision_2d.gpu_augment import gpu_augment
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -305,6 +306,21 @@ class TrainManiFlowRoboTwinWorkspace:
         train_sampling_batch = None
         val_sampling_batch = None   # first val batch, reused for val-split action-error (Lumi v2)
 
+        # Lumi v7 GPU augmentation: when cfg.gpu_augment is set, run the label-consistent SO(2)
+        # roll + photometric aug on the CUDA batch in the TRAIN loop (below) instead of per-sample
+        # on the CPU DataLoader workers (which starved the L40S). Reads the SAME augmentation
+        # params as the dataset block; the dataset skips its own SO(2)/photometric when
+        # augmentation.gpu_offload is true (avoids double-augmenting). TRAIN-ONLY: never applied
+        # to the val loop or the sampling batches.
+        _gpu_aug = None
+        if bool(cfg.get('gpu_augment', False)):
+            _gpu_aug = OmegaConf.to_container(cfg.robotwin_task.dataset.augmentation, resolve=True)
+            cprint(f"[GPU-AUG] on-device batch aug: rot_aug_deg={_gpu_aug.get('rot_aug_deg')} "
+                   f"photo(b/c/s/h)={_gpu_aug.get('photo_brightness')}/{_gpu_aug.get('photo_contrast')}/"
+                   f"{_gpu_aug.get('photo_saturation')}/{_gpu_aug.get('photo_hue')} "
+                   f"blur_p={_gpu_aug.get('photo_blur_p')} noise={_gpu_aug.get('photo_noise')} "
+                   f"erase_p={_gpu_aug.get('photo_erase_p')}", 'green')
+
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         for local_epoch_idx in range(cfg.training.num_epochs):
@@ -317,6 +333,9 @@ class TrainManiFlowRoboTwinWorkspace:
                     t1 = time.time()
                     # device transfer
                     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                    # GPU augmentation (TRAIN ONLY, on raw values before the policy normalizer)
+                    if _gpu_aug is not None:
+                        batch = gpu_augment(batch, _gpu_aug)
                     if train_sampling_batch is None:
                         train_sampling_batch = batch
                 
