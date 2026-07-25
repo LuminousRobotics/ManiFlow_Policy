@@ -60,6 +60,7 @@ policy:
   kpt_loss_weight: 0.0             # rail/tube keypoint soft-argmax head; 0 => no F heads built
   place_loss_weight: 0.0           # keypoint -> place-pose regression (vs goal_cam)
   n_keypoints: 7                   # converter N_KEYPOINTS (rail samples + tube)
+  pointnet_dim: 0                  # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
 
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128

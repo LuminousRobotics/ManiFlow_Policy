@@ -60,6 +60,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             kpt_loss_weight=0.0,               # lambda for rail/tube keypoint soft-argmax head; 0 => no F heads
             place_loss_weight=0.0,             # lambda for keypoint->place-pose regression (vs goal_cam)
             n_keypoints=7,                     # converter N_KEYPOINTS (rail samples + tube)
+            pointnet_dim=0,                    # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
             **kwargs):
         super().__init__()
 
@@ -250,6 +251,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             self.goal_from_kpts = None
             self.goal_token_proj = None
 
+        # --- F1-depth: PointNet on the xyz point-map -> a 3-D conditioning token (DP3-native;
+        # NOT depth-as-2D-channels through the encoder, which our C2 run proved the model ignores) ---
+        self.pointnet_dim = int(pointnet_dim)
+        if self.pointnet_dim > 0:
+            from maniflow.model.vision_2d.pointnet import PointNetEncoder
+            self.pointnet = PointNetEncoder(out_dim=obs_feature_dim)
+            cprint(f"[F1-depth] PointNet on xyz point-map -> {obs_feature_dim}-d 3D token", "green")
+        else:
+            self.pointnet = None
+
     def _kpt_and_goal(self, vis_cond, To):
         """Slice the most-recent visual frame's tokens from vis_cond (visual tokens come FIRST,
         row-major), reshape to (B,D,g,g), run the soft-argmax head -> keypoints (B,N,2) + presence
@@ -263,6 +274,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         place = self.goal_from_kpts(kp_feat)                           # (B,6) normalized place pose
         goal_token = self.goal_token_proj(place).unsqueeze(1)          # (B,1,D)
         return uv, conf, place, goal_token
+
+    def _pointnet_token(self, this_nobs, To):
+        """xyz point-map (depth_cam) -> masked cloud -> PointNet -> (B,1,D) 3-D token."""
+        from maniflow.model.vision_2d.pointnet import cloud_from_pointmap
+        dp = this_nobs['depth_cam'][:, To - 1]                         # (B,C,S,S) most-recent frame
+        pts, valid = cloud_from_pointmap(dp, stride=4)
+        return self.pointnet(pts, valid).unsqueeze(1)                  # (B,1,D)
 
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
@@ -373,6 +391,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if self.kpt_head is not None:                # F-series: append self-predicted goal token
             _, _, _, _goal_tok = self._kpt_and_goal(vis_cond, To)
             vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
+        if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
+            vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, To)], dim=1)
         # Lumi C2: compact control conditioning for AdaLN (no masking at inference)
         lowdim_cond = self._build_lowdim_cond(nobs, B, To, device)
         # empty data for action
@@ -697,6 +717,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if self.kpt_head is not None:
             f_uv, f_conf, f_place, _goal_tok = self._kpt_and_goal(vis_cond, self.n_obs_steps)
             vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
+        if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
+            vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, self.n_obs_steps)], dim=1)
         # Lumi C2: AdaLN control conditioning; proprio masking active in training only
         lowdim_cond = self._build_lowdim_cond(
             nobs, batch_size, self.n_obs_steps, self.device, train_mask=self.training)

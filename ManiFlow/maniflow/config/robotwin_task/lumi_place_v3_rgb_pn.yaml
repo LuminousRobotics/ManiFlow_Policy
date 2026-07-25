@@ -1,0 +1,57 @@
+# Lumi place-policy F1-DEPTH task — RGB + native-3D PointNet on the xyz point-map.
+# Selected via: robotwin_task=lumi_place_v3_rgb_pn
+#
+# Key routing: depth IS emitted (depth_input=xyz -> the dataset unprojects depth to a camera-frame
+# (X,Y,Z,valid) point map as obs['depth_cam']), but depth_cam is DELIBERATELY NOT in shape_meta, so
+# the 2D encoder never builds a depth trunk (that routing — depth-as-2D-CNN-channels — is exactly
+# what our C2 xyz run proved the model ignores). Instead the policy's PointNet (pointnet_dim>0)
+# consumes obs['depth_cam'] as a POINT CLOUD -> one 3D token appended to vis_cond (DP3-native).
+# prev_action dropped (F1 lineage). Pairs with equal-footing tokens + the soft-argmax keypoint head.
+
+name: lumi_place_v3_rgb_pn
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]               # [neighbor_present]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [6]                 # anchored-to-chunk-start camera-frame deltas [dx,dy,dz,rotvec(3)]
+    horizon: ${horizon}
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???               # override at launch: robotwin_task.dataset.zarr_path=...
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  use_depth: true              # read depth from the zarr + emit obs['depth_cam'] (for the PointNet)
+  depth_input: xyz             # 4-ch camera-frame point map [X/scale, Y/scale, Z/scale, valid]
+  augmentation:
+    enable: true
+    gpu_offload: true          # RGB SO(2)/photometric on the CUDA batch; depth aug stays CPU here
+    depth_noise_sigma0: 0.005
+    depth_px_dropout: 0.02
+    depth_flying_px: 0.005
+    depth_episode_dropout: 0.1
+    prev_action_noise_mm: 0.5
+    prev_action_noise_deg: 0.05
+    latency_shift_prob: 0.5
+    # SO(2) OFF for the depth run: co-rotating the xyz point-map under the roll is not yet supported
+    # (would need R_z on the per-pixel 3D coords); keep the RGB appearance aug + depth sensor noise.
+    rot_aug_deg: 0.0
+    photo_brightness: 0.3
+    photo_contrast: 0.3
+    photo_saturation: 0.3
+    photo_hue: 0.08
+    photo_blur_p: 0.3
+    photo_noise: 0.02
+    photo_erase_p: 0.3
