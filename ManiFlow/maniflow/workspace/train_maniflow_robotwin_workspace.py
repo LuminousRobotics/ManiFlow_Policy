@@ -95,6 +95,7 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
               'train_loss', 'val_loss', 'bc_loss',
               'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
               'loss_endpoint', 'loss_goal', 'loss_idm', 'loss_kpt', 'loss_place',
+              'kpt_px', 'place_mm',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',
               'val_goal_pos_mm', 'val_goal_rot_deg',
