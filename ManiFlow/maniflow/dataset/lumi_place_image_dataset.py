@@ -480,6 +480,11 @@ class LumiPlaceImageDataset(BaseDataset):
         goal_prior = np.concatenate(
             [sample['goal_pos_cam'], sample['goal_rot_cam'],
              np.ones((len(sample['goal_pos_cam']), 1))], axis=1).astype(np.float32)
+        # G0 STRUCTURAL control: drop_p>=1 disables the latch in ALL splits (train AND val),
+        # so checkpoint selection never scores the model under an input it wasn't trained on
+        # (review 2026-07-26: the augment-gated drop alone contaminated G0's val/selection).
+        if float(self.aug.get("goal_prior_drop_p", 0.0) or 0.0) >= 1.0:
+            goal_prior = np.zeros_like(goal_prior)
         depth_mm = (sample['depth'][:, ].astype(np.float32)   # (T,1,S,S) mm (float for aug)
                     if self.use_depth else None)
 
@@ -503,13 +508,14 @@ class LumiPlaceImageDataset(BaseDataset):
                     size=agent_pos.shape).astype(np.float32)
             if agent_pos is not None and sample_rng.random() < self.aug.get("agent_pos_mask_p", 0.0):
                 agent_pos = np.zeros_like(agent_pos)
-            # G1 goal-prior latch: scheduled-sampling noise + dropout
+            # G1 goal-prior latch: scheduled-sampling noise + dropout (independent guards)
             if self.aug.get("goal_prior_noise_mm", 0.0) > 0.0:
                 goal_prior[:, :3] += sample_rng.normal(
                     scale=self.aug["goal_prior_noise_mm"] / 1000.0,
                     size=goal_prior[:, :3].shape).astype(np.float32)
+            if self.aug.get("goal_prior_noise_deg", 0.0) > 0.0:
                 goal_prior[:, 3:6] += sample_rng.normal(
-                    scale=np.radians(self.aug.get("goal_prior_noise_deg", 0.0)),
+                    scale=np.radians(self.aug["goal_prior_noise_deg"]),
                     size=goal_prior[:, 3:6].shape).astype(np.float32)
             if sample_rng.random() < self.aug.get("goal_prior_drop_p", 0.0):
                 goal_prior = np.zeros_like(goal_prior)
