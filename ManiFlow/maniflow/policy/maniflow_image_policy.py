@@ -913,14 +913,19 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 loss_place = float(lpl.item())
             with torch.no_grad():                    # honest diagnostics (full-res px / mm)
                 vism = gt[..., 2]
-                scale = torch.tensor([1280.0, 720.0], device=f_uv.device, dtype=f_uv.dtype)
+                scale = torch.tensor([1280.0, 800.0], device=f_uv.device, dtype=f_uv.dtype)
                 pxe = torch.linalg.norm((f_uv - gt[..., :2]) * scale, dim=-1)
                 kpt_px = float(((pxe * vism).sum() / vism.sum().clamp(min=1)).item())
                 if self.place_loss_weight > 0.0 and 'goal_cam' in batch:
                     pl_un = self.normalizer['goal_cam'].unnormalize(f_place)
                     gc = batch['goal_cam'].to(self.device).reshape(pl_un.shape[0], -1)
-                    place_mm = float((torch.linalg.norm(
-                        pl_un[:, :3] - gc[:, :3], dim=-1).mean() * 1000.0).item())
+                    dist = torch.linalg.norm(pl_un[:, :3] - gc[:, :3], dim=-1)
+                    # FOV-mask like the loss: blanked samples are hallucinated priors and
+                    # would inflate G1's place_mm vs G0 (review 2026-07-26)
+                    kd = 1.0 - batch.get('fov_dropped',
+                                         torch.zeros_like(dist)).to(dist.dtype)
+                    place_mm = float(((dist * kd).sum()
+                                      / kd.sum().clamp(min=1) * 1000.0).item())
 
         loss = loss.mean()
         loss_dict = {
