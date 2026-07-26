@@ -178,4 +178,25 @@ def gpu_augment(batch, cfg, rng=None):
         d = torch.where(valid, d.clamp(min=0.0), torch.zeros_like(d))  # keep invalid==0
         obs['depth'] = d
 
+    # ---- G1 FOV-dropout: per-sample full visual blackout (RGB + depth), labels kept ----
+    # Converts the predictable terminal blindness ("rail always leaves FOV at the end") into
+    # "blindness can strike anywhere" -> the actor must lean on the goal_prior latch + proprio,
+    # and cannot shortcut on 'vision is always available'. Keypoint vis targets are zeroed so
+    # the perception heads are not asked to hallucinate; the place loss is masked via
+    # batch['fov_dropped'] (see policy.compute_loss).
+    fovp = float(cfg.get('fov_dropout_p', 0.0) or 0.0)
+    if fovp > 0.0:
+        sel = (torch.rand((B,), generator=g).to(device) < fovp)
+        if bool(sel.any()):
+            m = sel.view(B, 1, 1, 1, 1).to(obs['head_cam'].dtype)
+            obs['head_cam'] = obs['head_cam'] * (1.0 - m)
+            for dk in ('depth', 'depth_cam'):
+                if dk in obs:
+                    obs[dk] = obs[dk] * (1.0 - m)
+            if 'arm_kpts_uv' in batch:
+                kv = batch['arm_kpts_uv'].to(device).clone()
+                kv[sel, ..., 2] = 0.0
+                batch['arm_kpts_uv'] = kv
+        batch['fov_dropped'] = sel.to(obs['head_cam'].dtype)
+
     return batch

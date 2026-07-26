@@ -60,6 +60,7 @@ policy:
   kpt_loss_weight: 0.0             # rail/tube keypoint soft-argmax head; 0 => no F heads built
   place_loss_weight: 0.0           # keypoint -> place-pose regression (vs goal_cam)
   n_keypoints: 7                   # converter N_KEYPOINTS (rail samples + tube)
+  kpt_head_hires: false            # G1: 56x56 deconv heatmap head + log-z -> N 3-D point tokens
   pointnet_dim: 0                  # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
 
   diffusion_timestep_embed_dim: 128
@@ -112,16 +113,12 @@ policy:
     # the policy routes them into DiTX AdaLN-Zero (pair with policy.lowdim_to_adaln=true).
     lowdim_as_tokens: True
 
-    transforms:
-      - type: RandomCrop
-        ratio: 0.95
-      # C2: RandomRotation REMOVED — rotating pixels while camera-frame metric action/goal
-      # labels stay fixed injects ~±20-30mm label inconsistency at our working ranges.
-      - _target_: torchvision.transforms.ColorJitter
-        brightness: 0.3
-        contrast: 0.4
-        saturation: 0.5
-        hue: 0.08
+    # G1: encoder-side transforms REMOVED. The paired RandomCrop shifted pixels while the
+    # arm_kpts_uv keypoint labels stayed in full-frame coordinates -> systematic label noise
+    # up to ~5% of frame on the F-series keypoint supervision (found 2026-07-26). Photometric
+    # aug lives in the GPU-aug (label-free); a label-co-transformed shift-jitter is the
+    # next-run replacement for the crop.
+    transforms: null
      
     use_group_norm: True
     share_rgb_model: False

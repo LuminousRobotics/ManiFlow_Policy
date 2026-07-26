@@ -60,6 +60,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             kpt_loss_weight=0.0,               # lambda for rail/tube keypoint soft-argmax head; 0 => no F heads
             place_loss_weight=0.0,             # lambda for keypoint->place-pose regression (vs goal_cam)
             n_keypoints=7,                     # converter N_KEYPOINTS (rail samples + tube)
+            kpt_head_hires=False,              # G1: 56x56 deconv heatmap head + log-z -> N 3-D point tokens
             pointnet_dim=0,                    # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
             **kwargs):
         super().__init__()
@@ -231,25 +232,44 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.kpt_loss_weight = float(kpt_loss_weight)
         self.place_loss_weight = float(place_loss_weight)
         self.n_keypoints = int(n_keypoints)
+        self.kpt_head_hires = bool(kpt_head_hires)
+        self.goal_token_proj = None
         if self.kpt_loss_weight > 0.0:
-            from maniflow.model.vision_2d.soft_argmax import SoftArgmaxKeypointHead
             ds = int(getattr(obs_encoder, 'downsample_ratio', 32))
             img_hw = int(obs_shape_meta['head_cam']['shape'][-1])
             self._kpt_grid = max(1, img_hw // ds)                       # 224 // 32 = 7
-            self.kpt_head = SoftArgmaxKeypointHead(obs_feature_dim, self.n_keypoints)
-            self.goal_from_kpts = nn.Sequential(                        # [u,v,conf]*N -> place pose
-                nn.LayerNorm(self.n_keypoints * 3),
-                nn.Linear(self.n_keypoints * 3, 256), nn.GELU(), nn.Linear(256, 6))
-            self.goal_token_proj = nn.Sequential(                      # place pose -> conditioning token
-                nn.Linear(6, obs_feature_dim), nn.GELU(),
-                nn.Linear(obs_feature_dim, obs_feature_dim))
-            cprint(f"[F-series] soft-argmax keypoint head: {self.n_keypoints} kpts on a "
-                   f"{self._kpt_grid}x{self._kpt_grid} grid -> place-pose goal token "
-                   f"(kpt_w={self.kpt_loss_weight} place_w={self.place_loss_weight})", "green")
+            if self.kpt_head_hires:
+                # G1: SimpleBaseline deconv 7->56 heatmaps + windowed soft-argmax + metric
+                # log-z -> camera-frame 3-D points -> N POINT TOKENS (not one pooled goal
+                # token; fixes the 1-token collapse). Backprojection needs cam_k_norm
+                # (set from the dataset by the workspace; baked into the ckpt/ONNX).
+                from maniflow.model.vision_2d.heatmap_head import HeatmapKeypointHead
+                self.kpt_head = HeatmapKeypointHead(obs_feature_dim, self.n_keypoints)
+                self.register_buffer('cam_k_norm_buf', torch.zeros(4))
+                self.kpt_token_proj = nn.Linear(4, obs_feature_dim)     # [X,Y,Z,conf] -> token
+                self.kpt_id_emb = nn.Parameter(
+                    torch.randn(self.n_keypoints, obs_feature_dim) * 0.02)
+                self.goal_from_kpts = nn.Sequential(                    # [pts3d,conf]*N -> place (AUX)
+                    nn.LayerNorm(self.n_keypoints * 4),
+                    nn.Linear(self.n_keypoints * 4, 256), nn.GELU(), nn.Linear(256, 6))
+                cprint(f"[G1] hires heatmap head: {self.n_keypoints} kpts @56x56 + log-z "
+                       f"-> {self.n_keypoints} 3-D point tokens "
+                       f"(kpt_w={self.kpt_loss_weight} place_w={self.place_loss_weight})", "green")
+            else:
+                from maniflow.model.vision_2d.soft_argmax import SoftArgmaxKeypointHead
+                self.kpt_head = SoftArgmaxKeypointHead(obs_feature_dim, self.n_keypoints)
+                self.goal_from_kpts = nn.Sequential(                    # [u,v,conf]*N -> place pose
+                    nn.LayerNorm(self.n_keypoints * 3),
+                    nn.Linear(self.n_keypoints * 3, 256), nn.GELU(), nn.Linear(256, 6))
+                self.goal_token_proj = nn.Sequential(                  # place pose -> conditioning token
+                    nn.Linear(6, obs_feature_dim), nn.GELU(),
+                    nn.Linear(obs_feature_dim, obs_feature_dim))
+                cprint(f"[F-series] soft-argmax keypoint head: {self.n_keypoints} kpts on a "
+                       f"{self._kpt_grid}x{self._kpt_grid} grid -> place-pose goal token "
+                       f"(kpt_w={self.kpt_loss_weight} place_w={self.place_loss_weight})", "green")
         else:
             self.kpt_head = None
             self.goal_from_kpts = None
-            self.goal_token_proj = None
 
         # --- F1-depth: PointNet on the xyz point-map -> a 3-D conditioning token (DP3-native;
         # NOT depth-as-2D-channels through the encoder, which our C2 run proved the model ignores) ---
@@ -261,19 +281,33 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         else:
             self.pointnet = None
 
-    def _kpt_and_goal(self, vis_cond, To):
+    def _kpt_and_goal(self, vis_cond, To, depth_z=None, cam_k=None):
         """Slice the most-recent visual frame's tokens from vis_cond (visual tokens come FIRST,
-        row-major), reshape to (B,D,g,g), run the soft-argmax head -> keypoints (B,N,2) + presence
-        (B,N) -> place pose (B,6) -> goal token (B,1,D). Returns (uv, conf, place, goal_token)."""
+        row-major), reshape to (B,D,g,g), run the keypoint head.
+
+        Legacy (soft-argmax): -> place pose -> ONE goal token. Returns (uv, conf, place, tok, {}).
+        G1 hires: 56x56 heatmaps + windowed soft-argmax + metric log-z -> camera-frame 3-D
+        points -> N point tokens (+ aux place readout). depth_z (B,2,H,W) [z_m, valid] optionally
+        fuses sensor depth into the z head; cam_k (B,4) per-sample effective intrinsics when the
+        GPU aug shift-jitters the frame (falls back to the cam_k_norm_buf buffer).
+        Returns (uv, conf, place, goal_tokens (B,N,D), extras dict)."""
         B = vis_cond.shape[0]; D = vis_cond.shape[-1]
         g = self._kpt_grid; Lg = g * g
         vis = vis_cond[:, (To - 1) * Lg: To * Lg, :]                    # (B, Lg, D) most-recent frame
         fmap = vis.transpose(1, 2).reshape(B, D, g, g)                  # (B, D, g, g)
+        if self.kpt_head_hires:
+            k = cam_k if cam_k is not None else self.cam_k_norm_buf
+            out = self.kpt_head(fmap, cam_k_norm=k, depth_z=depth_z)
+            conf_s = torch.sigmoid(out["conf"]).unsqueeze(-1)           # (B,N,1)
+            feat = torch.cat([out["pts3d"], conf_s], dim=-1)            # (B,N,4)
+            place = self.goal_from_kpts(feat.reshape(B, -1))            # (B,6) AUX readout
+            tokens = self.kpt_token_proj(feat) + self.kpt_id_emb.unsqueeze(0)  # (B,N,D)
+            return out["uv"], out["conf"], place, tokens, out
         uv, conf = self.kpt_head(fmap)                                 # (B,N,2), (B,N)
         kp_feat = torch.cat([uv, torch.sigmoid(conf).unsqueeze(-1)], dim=-1).reshape(B, -1)
         place = self.goal_from_kpts(kp_feat)                           # (B,6) normalized place pose
         goal_token = self.goal_token_proj(place).unsqueeze(1)          # (B,1,D)
-        return uv, conf, place, goal_token
+        return uv, conf, place, goal_token, {}
 
     def _pointnet_token(self, this_nobs, To):
         """xyz point-map (depth_cam) -> masked cloud -> PointNet -> (B,1,D) 3-D token."""
@@ -281,6 +315,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         dp = this_nobs['depth_cam'][:, To - 1]                         # (B,C,S,S) most-recent frame
         pts, valid = cloud_from_pointmap(dp, stride=4)
         return self.pointnet(pts, valid).unsqueeze(1)                  # (B,1,D)
+
+    def _kpt_depth_z(self, this_nobs, To):
+        """(B,2,S,S) [z_metres, valid] from the xyz point-map for the G1 z-fusion, or None.
+        xyz map channels are [X,Y,Z,valid] scaled by XYZ_SCALE_M=2.5 (dataset _encode_depth)."""
+        if not self.kpt_head_hires or 'depth_cam' not in this_nobs:
+            return None
+        dp = this_nobs['depth_cam'][:, To - 1]                         # (B,4,S,S) most-recent frame
+        if dp.shape[1] < 4:
+            return None
+        return torch.stack([dp[:, 2] * 2.5, dp[:, 3]], dim=1)          # (B,2,S,S)
 
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
@@ -388,8 +432,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
         nobs_features = self.obs_encoder(this_nobs).to(device)
         vis_cond = nobs_features.reshape(B, -1, Do) # B, self.n_obs_steps*L, Do
-        if self.kpt_head is not None:                # F-series: append self-predicted goal token
-            _, _, _, _goal_tok = self._kpt_and_goal(vis_cond, To)
+        if self.kpt_head is not None:                # F-series: append self-predicted goal token(s)
+            _, _, _, _goal_tok, _ = self._kpt_and_goal(
+                vis_cond, To, depth_z=self._kpt_depth_z(this_nobs, To))
             vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
         if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
             vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, To)], dim=1)
@@ -714,8 +759,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # F-series: self-predicted goal token appended to the visual conditioning (actor path).
         # Gradient from the action loss flows through the goal token -> keypoints -> encoder.
         f_uv = f_conf = f_place = None
+        f_extras = {}
         if self.kpt_head is not None:
-            f_uv, f_conf, f_place, _goal_tok = self._kpt_and_goal(vis_cond, self.n_obs_steps)
+            f_uv, f_conf, f_place, _goal_tok, f_extras = self._kpt_and_goal(
+                vis_cond, self.n_obs_steps,
+                depth_z=self._kpt_depth_z(this_nobs, self.n_obs_steps),
+                cam_k=batch.get('cam_k_eff', None))
             vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
         if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
             vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, self.n_obs_steps)], dim=1)
@@ -834,17 +883,44 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # --- F-series: soft-argmax keypoint loss (vis-masked) + place-pose regression loss ---
         loss_kpt = 0.0
         loss_place = 0.0
+        kpt_px = 0.0
+        place_mm = 0.0
         if self.kpt_head is not None and f_uv is not None and 'arm_kpts_uv' in batch:
-            from maniflow.model.vision_2d.soft_argmax import keypoint_loss
             gt = batch['arm_kpts_uv'][:, self.n_obs_steps - 1].to(self.device)   # (B,N,3) recent obs frame
-            lk_pos, lk_pres = keypoint_loss(f_uv, f_conf, gt[..., :2], gt[..., 2])
-            loss = loss + self.kpt_loss_weight * (lk_pos + lk_pres)
-            loss_kpt = float((lk_pos + lk_pres).item())
+            if self.kpt_head_hires:
+                # G1: Gaussian-target heatmap CE (vis-masked) + presence BCE (0.2) + metric log-z
+                from maniflow.model.vision_2d.heatmap_head import heatmap_kpt_loss
+                gt_z = (batch['arm_kpts_cam'][:, self.n_obs_steps - 1, :, 2].to(self.device)
+                        if 'arm_kpts_cam' in batch else None)
+                lk_heat, lk_pres, lk_z = heatmap_kpt_loss(f_extras, gt[..., :2], gt[..., 2], gt_z)
+                lk_total = lk_heat + 0.2 * lk_pres + lk_z
+                loss = loss + self.kpt_loss_weight * lk_total
+                loss_kpt = float(lk_total.item())
+            else:
+                from maniflow.model.vision_2d.soft_argmax import keypoint_loss
+                lk_pos, lk_pres = keypoint_loss(f_uv, f_conf, gt[..., :2], gt[..., 2])
+                loss = loss + self.kpt_loss_weight * (lk_pos + lk_pres)
+                loss_kpt = float((lk_pos + lk_pres).item())
             if self.place_loss_weight > 0.0 and 'goal_cam' in batch:
                 goal_norm = self.normalizer['goal_cam'].normalize(batch['goal_cam']).to(self.device)
-                lpl = F.smooth_l1_loss(f_place, goal_norm)
+                lpl_el = F.smooth_l1_loss(f_place, goal_norm, reduction='none')
+                lpl_b = lpl_el.reshape(lpl_el.shape[0], -1).mean(-1)             # (B,)
+                # FOV-dropout aug blanks the frame: no keypoints => don't force the place
+                # readout to hallucinate (the DiT should lean on the goal_prior latch there)
+                keep = 1.0 - batch.get('fov_dropped', torch.zeros_like(lpl_b)).to(lpl_b.dtype)
+                lpl = (lpl_b * keep).sum() / keep.sum().clamp(min=1e-6)
                 loss = loss + self.place_loss_weight * lpl
                 loss_place = float(lpl.item())
+            with torch.no_grad():                    # honest diagnostics (full-res px / mm)
+                vism = gt[..., 2]
+                scale = torch.tensor([1280.0, 720.0], device=f_uv.device, dtype=f_uv.dtype)
+                pxe = torch.linalg.norm((f_uv - gt[..., :2]) * scale, dim=-1)
+                kpt_px = float(((pxe * vism).sum() / vism.sum().clamp(min=1)).item())
+                if self.place_loss_weight > 0.0 and 'goal_cam' in batch:
+                    pl_un = self.normalizer['goal_cam'].unnormalize(f_place)
+                    gc = batch['goal_cam'].to(self.device).reshape(pl_un.shape[0], -1)
+                    place_mm = float((torch.linalg.norm(
+                        pl_un[:, :3] - gc[:, :3], dim=-1).mean() * 1000.0).item())
 
         loss = loss.mean()
         loss_dict = {
@@ -854,6 +930,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'loss_goal': loss_goal,
                 'loss_idm': loss_idm,
                 'loss_kpt': loss_kpt,
+                'kpt_px': kpt_px,
+                'place_mm': place_mm,
                 'loss_place': loss_place,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,

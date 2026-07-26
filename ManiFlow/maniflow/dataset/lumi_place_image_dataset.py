@@ -52,6 +52,14 @@ DEFAULT_AUGMENTATION = {
     "depth_episode_dropout": 0.4,    # fraction of episodes with depth fully zeroed
     "prev_action_noise_mm": 0.5,     # gaussian on prev_action translation [mm]
     "prev_action_noise_deg": 0.05,   # gaussian on prev_action rotvec [deg]
+    # G1 proprio + goal-prior latch aug (all 0 => off). Noise at DEPLOYMENT-error scale
+    # (Adapt-Your-Body/DART calibration), not sensor scale; masks fight the copycat.
+    "agent_pos_noise_deg": 0.0,      # gaussian on joint positions [deg]
+    "agent_pos_mask_p": 0.0,         # per-sample prob of zeroing the whole agent_pos block
+    "goal_prior_noise_mm": 0.0,      # gaussian on the goal_prior position [mm]
+    "goal_prior_noise_deg": 0.0,     # gaussian on the goal_prior rotvec [deg]
+    "goal_prior_drop_p": 0.0,        # per-sample prob the latch is absent (zeros + conf 0)
+    "fov_dropout_p": 0.0,            # GPU-aug: per-sample prob of blanking the recent RGB frame
     "latency_shift_prob": 0.5,       # per-episode prob a stream lags 1 control tick
     "rot_aug_deg": 0.0,              # v7 Rewire: SO(2) optical-axis roll aug half-range [deg]; 0 => off
     "gpu_offload": False,            # v7 GPU-aug: skip CPU SO(2)+photometric here (workspace does it on
@@ -166,9 +174,10 @@ class LumiPlaceImageDataset(BaseDataset):
             buffer_keys.insert(1, 'depth')
         # F-series: load rail/tube keypoint targets if the zarr has them (v8+; back-compat with v7).
         _zk = set(zarr.open(str(zarr_path), mode='r')['data'].keys())
-        for _k in ('arm_kpts_uv', 'arm_kpts_cam'):
+        for _k in ('arm_kpts_uv', 'arm_kpts_cam', 'agent_pos'):
             if _k in _zk:
                 buffer_keys.append(_k)
+        self.has_agent_pos = 'agent_pos' in _zk
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=buffer_keys)
 
         # C2 "xyz" point-map mode: unproject each depth pixel to metric camera-frame
@@ -279,6 +288,15 @@ class LumiPlaceImageDataset(BaseDataset):
                     axis=1),
                 'prev_action': self.replay_buffer['prev_action'],
                 'task': self.replay_buffer['task'],
+                # G1: latch = [goal(6), conf(1)]; conf column fit over [0,1] (dropout emits 0s
+                # at train — a constant-1 fit would make the limits normalizer degenerate)
+                'goal_prior': np.concatenate(
+                    [self.replay_buffer['goal_pos_cam'], self.replay_buffer['goal_rot_cam'],
+                     np.concatenate([np.zeros((1, 1), dtype=np.float32),
+                                     np.ones((len(self.replay_buffer['goal_pos_cam']) - 1, 1),
+                                             dtype=np.float32)])], axis=1),
+                **({'agent_pos': self.replay_buffer['agent_pos']}
+                   if self.has_agent_pos else {}),
             },
             last_n_dims=1, mode=mode, **kwargs)
         normalizer['head_cam'] = SingleFieldLinearNormalizer.create_identity()
@@ -452,6 +470,16 @@ class LumiPlaceImageDataset(BaseDataset):
     def _sample_to_data(self, sample, ep_idx=None, sample_idx=0):
         task = sample['task'][:, ].astype(np.float32)
         prev_action = sample['prev_action'][:, ].astype(np.float32)
+        # G1: ManiFlow-faithful joint proprio (v9 zarr) + the goal-prior LATCH channel.
+        # goal_prior = per-frame [goal_pos_cam, goal_rot_cam, conf]. Because the rail is
+        # STATIC and FK is exact, the deploy-time FK-propagated latch equals the current
+        # true label + estimate noise — so scheduled sampling is just label+noise+dropout
+        # (Swift/Nature-2023 architecture, no pose math needed).
+        agent_pos = (sample['agent_pos'][:, ].astype(np.float32)
+                     if 'agent_pos' in sample else None)
+        goal_prior = np.concatenate(
+            [sample['goal_pos_cam'], sample['goal_rot_cam'],
+             np.ones((len(sample['goal_pos_cam']), 1))], axis=1).astype(np.float32)
         depth_mm = (sample['depth'][:, ].astype(np.float32)   # (T,1,S,S) mm (float for aug)
                     if self.use_depth else None)
 
@@ -468,6 +496,23 @@ class LumiPlaceImageDataset(BaseDataset):
             if depth_mm is not None:
                 depth_mm = self._augment_depth_mm(depth_mm, ep_rng, sample_rng)
             prev_action = self._augment_prev_action(prev_action, sample_rng)
+            # G1 proprio noise + mask (anti-copycat; deployment-error scale)
+            if agent_pos is not None and self.aug.get("agent_pos_noise_deg", 0.0) > 0.0:
+                agent_pos = agent_pos + sample_rng.normal(
+                    scale=np.radians(self.aug["agent_pos_noise_deg"]),
+                    size=agent_pos.shape).astype(np.float32)
+            if agent_pos is not None and sample_rng.random() < self.aug.get("agent_pos_mask_p", 0.0):
+                agent_pos = np.zeros_like(agent_pos)
+            # G1 goal-prior latch: scheduled-sampling noise + dropout
+            if self.aug.get("goal_prior_noise_mm", 0.0) > 0.0:
+                goal_prior[:, :3] += sample_rng.normal(
+                    scale=self.aug["goal_prior_noise_mm"] / 1000.0,
+                    size=goal_prior[:, :3].shape).astype(np.float32)
+                goal_prior[:, 3:6] += sample_rng.normal(
+                    scale=np.radians(self.aug.get("goal_prior_noise_deg", 0.0)),
+                    size=goal_prior[:, 3:6].shape).astype(np.float32)
+            if sample_rng.random() < self.aug.get("goal_prior_drop_p", 0.0):
+                goal_prior = np.zeros_like(goal_prior)
             lat_rng = np.random.default_rng([self.seed, 424243, ep_idx])
             p = self.aug["latency_shift_prob"]
             # C2: depth is the SAME physical camera as head_cam — never lag it independently
@@ -491,9 +536,12 @@ class LumiPlaceImageDataset(BaseDataset):
 
         obs = {
             'head_cam': head_cam,
+            'goal_prior': goal_prior,
             'prev_action': prev_action,
             'task': task,
         }
+        if agent_pos is not None:
+            obs['agent_pos'] = agent_pos
         if depth_mm is not None:
             depth_cam = self._encode_depth(depth_mm)
             self._check_depth_channels(depth_cam)

@@ -321,7 +321,17 @@ class TrainManiFlowRoboTwinWorkspace:
                    f"photo(b/c/s/h)={_gpu_aug.get('photo_brightness')}/{_gpu_aug.get('photo_contrast')}/"
                    f"{_gpu_aug.get('photo_saturation')}/{_gpu_aug.get('photo_hue')} "
                    f"blur_p={_gpu_aug.get('photo_blur_p')} noise={_gpu_aug.get('photo_noise')} "
-                   f"erase_p={_gpu_aug.get('photo_erase_p')}", 'green')
+                   f"erase_p={_gpu_aug.get('photo_erase_p')} fov_drop={_gpu_aug.get('fov_dropout_p')}",
+                   'green')
+        # G1: bake the normalized intrinsics into the policy for the heatmap-head backprojection
+        # (buffer -> checkpoint -> ONNX; no extra runtime input at deploy).
+        _k = getattr(dataset, 'cam_k_norm', None)
+        if _k is not None and bool(getattr(self.model, 'kpt_head_hires', False)):
+            import torch as _torch
+            for _m in (self.model, getattr(self, 'ema_model', None)):
+                if _m is not None and hasattr(_m, 'cam_k_norm_buf'):
+                    _m.cam_k_norm_buf.copy_(_torch.as_tensor(_k, dtype=_torch.float32))
+            cprint(f"[G1] cam_k_norm_buf set: {[round(float(x), 4) for x in _k]}", 'green')
 
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
