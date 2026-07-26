@@ -63,3 +63,10 @@ dataset:
     photo_blur_p: 0.3
     photo_noise: 0.02
     photo_erase_p: 0.3
+    # ---- G1 anti-shortcut DR (schema keys; values set per-run via training_config) ----
+    agent_pos_noise_deg: 0.0
+    agent_pos_mask_p: 0.0
+    goal_prior_noise_mm: 0.0
+    goal_prior_noise_deg: 0.0
+    goal_prior_drop_p: 0.0
+    fov_dropout_p: 0.0
