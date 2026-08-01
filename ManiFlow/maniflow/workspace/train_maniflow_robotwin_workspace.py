@@ -89,13 +89,25 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
       health:      v_flow_pred_magnitude, v_ct_pred_magnitude (collapse detectors)
       accuracy:    train_action_mse_error
       optim:       lr, grad_norm, param_norm
-    Missing keys are written blank so the header stays stable across epochs."""
+      H-series:    the §3.2 constraint losses + THEIR MASK FRACTIONS (see below)
+    Missing keys are written blank so the header stays stable across epochs.
+
+    DictWriter runs with extrasaction='ignore', so a key the policy logs but this list omits is
+    SILENTLY DROPPED — which is how a dead loss stays invisible. The H goal-arm block is listed
+    explicitly for that reason, and `goal_reach_frac`/`goal_int_frac` are listed NEXT TO the
+    losses they gate: a NaN loss with a 0.00 fraction says "nothing was supervised this epoch",
+    which is the distinction a bare 0.0 destroyed (contract §9.2/§9.8)."""
     import csv as _csv
     fields = ['epoch', 'global_step',
               'train_loss', 'val_loss', 'bc_loss',
               'loss_flow', 'loss_ct', 'val_loss_flow', 'val_loss_ct',
               'loss_endpoint', 'loss_goal', 'loss_idm', 'loss_kpt', 'loss_place',
-              'kpt_px', 'place_mm',
+              'kpt_px', 'place_mm', 'place_mm_z',
+              # ---- H (contract §3.2/§9.2): every constraint loss + the mask that gates it ----
+              'loss_goal_int', 'goal_int_mm', 'goal_int_frac',
+              'loss_term', 'goal_reach_frac',
+              'loss_goal_cons', 'loss_rate', 'loss_rail_aux',
+              'loss_phase', 'phase_acc', 'loss_done', 'self_frame_frac',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',
               'val_goal_pos_mm', 'val_goal_rot_deg',
@@ -344,6 +356,15 @@ class TrainManiFlowRoboTwinWorkspace:
             for _m in (self.model, getattr(self, 'ema_model', None)):
                 if _m is not None and hasattr(_m, 'set_epoch'):
                     _m.set_epoch(self.epoch)
+            # ... and the DATASET's per-sample augmentation RNG (contract §9.4). Without this the
+            # timing gap/lag, goal-frame noise and proprio DR of a given sample are the SAME
+            # numbers on every epoch of the run, which turns scheduled sampling into a fixed
+            # per-sample bias. The dataset holds the counter in SHARED MEMORY because
+            # `persistent_workers: True` means the DataLoader workers are long-lived forks — a
+            # plain attribute write here would never reach them.
+            for _d in (dataset, val_dataset):
+                if hasattr(_d, 'set_epoch'):
+                    _d.set_epoch(self.epoch)
             # ========= train for this epoch ==========
             train_losses = list()
             with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
