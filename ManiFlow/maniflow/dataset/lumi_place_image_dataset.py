@@ -313,7 +313,21 @@ H_REQUIRED_ZARR_KEYS = (
 # equal to the un-covered distance (>150mm early in a descent). We therefore ship a per-sample
 # `h_goal_inreach` mask and apply the integral loss only where the constraint holds. Deliberate
 # addition to §3.2 (no new config knob) — documented in the H report.
+#
+# THE MASK IS EVALUATED AGAINST THE **CLEAN GT GOAL** (contract §9.2). It is a statement about
+# LABEL GEOMETRY — "does this window's horizon actually reach the place goal?" — and label
+# geometry does not move when scheduled sampling perturbs the OUTPUT FRAME. Measuring it against
+# the noised goal instead compares a 5 mm tolerance against a 15 mm-sigma 3-D perturbation:
+# P(pass) ~ 0.4%, which is not a mask but an off switch. Measured before the fix: in-reach
+# fraction 0.55 clean -> 0.000 noised (0/80 samples), and the flagship arm's signature loss
+# logged 0.0 — i.e. "perfect" — on every batch with nothing supervised behind it.
 H_GOAL_INTEGRAL_TOL_M = 0.005      # 5 mm == the terminal precision target
+
+# Goal-frame normalizer coverage (contract §9.5): how many fixed-seed goal-frame-noise draws are
+# appended to each window's CLEAN rows when fitting the action normalizer. 0 reproduces the old
+# clean-only fit. 2 costs one extra pass over the pose windows (no image IO) at startup and
+# covers the +-3 sigma tail of a 15 mm / 1.5 deg perturbation on the near-terminal rows.
+H_NORM_NOISE_DRAWS = 2
 
 
 def h_action_rows(action_param: str, action_frame: str, pose_horizon: int) -> int:
@@ -420,6 +434,7 @@ GRASP_PROBE_MAX_ROT_RAD = np.radians(1.0)
 
 
 def panel_to_ee_goal_maps(R_tcp0_cam, cam_minus_ee_cam, grasp_offset, q7_goal,
+                          R_c0_from_cimg=None,
                           invert_offset: bool = GRASP_OFFSET_INVERT):
     """Precompute the (tiny) constant maps that turn a PREDICTED `panel_goal_cam` into the ee_link
     goal + the goal frame, all expressed in the camera frame at the anchor ("C0").
@@ -435,25 +450,34 @@ def panel_to_ee_goal_maps(R_tcp0_cam, cam_minus_ee_cam, grasp_offset, q7_goal,
     raw camera/TCP pose the composition needs. These four constants make the policy-side
     composition three matmuls, exactly and differentiably, with no new obs input.
 
-    Derivation. `panel_goal_cam` is camera-frame-ABSOLUTE (unlike `rail_a_cam`), so with
-    Y = exp(panel_goal_cam[3:6]) and c_p = panel_goal_cam[0:3]:
-        R_cv0.T @ R_panel_goal = Y        and     R_cv0.T @ (p_panel_goal - p_cam0) = c_p.
+    Derivation. `panel_goal_cam` is camera-frame-ABSOLUTE (unlike `rail_a_cam`), and per contract
+    §9.3 the place head is supervised in the frame of the camera that captured the MOST RECENT
+    USED IMAGE ("Cimg"), which under the §5 timing augmentation is `image_lag_frames` control
+    frames BEFORE the anchor. So with Y = exp(panel_goal_cam[3:6]) and c_p = panel_goal_cam[0:3]
+    taken at THAT frame:
+        R_cimg.T @ R_panel_goal = Y       and     R_cimg.T @ (p_panel_goal - p_cam_img) = c_p,
+    and `A` := R_c0_from_cimg = R_cv0.T @ R_cimg carries Cimg quantities into C0 (A == I whenever
+    the image frame IS the anchor, i.e. lag 0 — which is every eval/export sample).
     With Q := inv(T_tcp_panel) (invert_offset=True; §1.2a) = (Rq, pq) = (R_off.T, -R_off.T @ p_off),
         T_tcp_goal = T_panel_goal @ Q  =>  R_gt = R_panel_goal @ Rq,
                                            p_gt = p_panel_goal + R_panel_goal @ pq
     then ee_link (contract §0): R_ge = R_gt @ Rz(-q7_goal), p_ge = p_gt + R_gt @ [0, +Y_OFF, 0].
     Pushing into C0 and re-anchoring the position at p_ee0:
-        p_goal_ee (in C0, rel. p_ee0) = c_p + Y @ tvec + cam_minus_ee_cam
-        R_goal_ee (in C0)             = Y @ R_ee
-        goal FRAME (in C0)            = Y @ R_frame        [ == exp(goal_rot_cam) ]
-    `cam_minus_ee_cam` = R_cv0.T @ (p_cam0 - p_ee0) re-anchors from the camera (where
-    `panel_goal_cam` lives) to p_ee0 (where the action rows are anchored).
+        p_goal_ee (in C0, rel. p_ee0) = A @ (c_p + Y @ tvec) + cam_minus_ee_cam
+        R_goal_ee (in C0)             = A @ Y @ R_ee
+        goal FRAME (in C0)            = A @ Y @ R_frame    [ == exp(goal_rot_cam) ]
+    `cam_minus_ee_cam` = R_cv0.T @ (p_cam_img - p_ee0) re-anchors from the camera THAT TOOK THE
+    IMAGE (where `panel_goal_cam` lives) to p_ee0 (where the action rows are anchored). Note both
+    `A` and this offset use the IMAGE camera; `R_tcp0_cam` uses the ANCHOR tcp pose, because the
+    goal frame is defined by the anchor's TCP orientation (§3).
 
     `invert_offset=False` selects the WRONG convention and exists only so
     `_probe_grasp_offset_convention` can measure the discrimination margin. Do not set it.
     """
     R_tcp0_cam = np.asarray(R_tcp0_cam, dtype=np.float64)
     cam_minus_ee_cam = np.asarray(cam_minus_ee_cam, dtype=np.float64).reshape(3)
+    A = (np.eye(3) if R_c0_from_cimg is None
+         else np.asarray(R_c0_from_cimg, dtype=np.float64).reshape(3, 3))
     go = np.asarray(grasp_offset, dtype=np.float64).reshape(7)
     p_off, R_off = go[:3], quat_wxyz_to_rotmat(go[3:])
     if invert_offset:                       # Q = inv(T_tcp_panel)   <- contract §1.2a
@@ -464,6 +488,7 @@ def panel_to_ee_goal_maps(R_tcp0_cam, cam_minus_ee_cam, grasp_offset, q7_goal,
     return {
         "tvec": tvec.astype(np.float32),                            # (3,)
         "toff": cam_minus_ee_cam.astype(np.float32),                # (3,)
+        "A": A.astype(np.float32),                                  # (3,3) Cimg -> C0
         "R_ee": (Rq @ rotz(-float(q7_goal))).astype(np.float32),    # (3,3)
         "R_frame": (Rq @ R_tcp0_cam.T).astype(np.float32),          # (3,3)
     }
@@ -627,6 +652,16 @@ class LumiPlaceImageDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.seed = seed
+        # ---- epoch counter for the per-sample augmentation RNG (contract §9.4) -------------
+        # WHY A SHARED-MEMORY TENSOR AND NOT AN INT: the train DataLoader runs with
+        # `persistent_workers: True`, so each worker holds a FORKED COPY of this dataset for the
+        # whole run. A plain `self._epoch = 0` written in the parent would never reach them and
+        # `set_epoch` would be a silent no-op — the exact bug class §9.4 exists to kill. A
+        # shared-memory tensor is visible to the forked children, mirroring the policy-side
+        # `h_epoch` buffer pattern (and, like it, resume-safe: the workspace passes its restored
+        # `self.epoch`, so a resumed run continues the augmentation schedule instead of replaying
+        # epoch 0's draws).
+        self._epoch = torch.zeros((), dtype=torch.long).share_memory_()
 
         aug = dict(DEFAULT_AUGMENTATION)
         if augmentation:
@@ -659,6 +694,23 @@ class LumiPlaceImageDataset(BaseDataset):
                    f"image_lag_probs={self.image_lag_probs} (eval/export = gap 1, lag 0)", "green")
             self.grasp_offset_invert = self._probe_grasp_offset_convention()
 
+    def set_epoch(self, epoch: int):
+        """Advance the per-sample augmentation RNG (contract §9.4). Called by the workspace once
+        per epoch, BEFORE the epoch's iteration starts.
+
+        Without this the seed `[seed, 7777777, ep_idx, sample_idx]` is a pure function of the
+        sample index, so every sample got the SAME timing gap/lag, the SAME goal-frame noise and
+        the SAME proprio DR offsets for the entire run: scheduled sampling degenerates into a
+        fixed per-sample bias the network can memorise, and the timing augmentation stops being
+        augmentation at all (it becomes a fixed re-labelling of the dataset). The epoch enters
+        the seed rather than driving a stateful generator so a sample stays DETERMINISTIC within
+        an epoch (reproducible, worker-count-independent) while differing across epochs."""
+        self._epoch.fill_(int(epoch))
+
+    @property
+    def epoch(self) -> int:
+        return int(self._epoch.item())
+
     @staticmethod
     def _h_probs(value, n, default):
         """Validate an H timing-aug probability vector; None -> the nominal default."""
@@ -683,12 +735,15 @@ class LumiPlaceImageDataset(BaseDataset):
             invert_offset=invert)
         pg = np.asarray(rb['panel_goal_cam'][idx], np.float64).reshape(6)
         Y = rotvec_to_rotmat(pg[3:])
-        # (a) goal FRAME: Y @ R_frame must equal exp(goal_rot_cam)
-        F_pred = Y @ np.asarray(m["R_frame"], np.float64)
+        # A == I here (this probe evaluates label and anchor at the SAME frame), but the formula
+        # is written with it so it stays a line-for-line twin of the policy's `_h_reframe`.
+        A = np.asarray(m["A"], np.float64)
+        # (a) goal FRAME: A @ Y @ R_frame must equal exp(goal_rot_cam)
+        F_pred = A @ Y @ np.asarray(m["R_frame"], np.float64)
         F_gt = rotvec_to_rotmat(np.asarray(rb['goal_rot_cam'][idx], np.float64).reshape(3))
         e_rot = float(np.abs(rotmat_to_rotvec(F_pred @ F_gt.T)).max())
         # (b) ee goal POSITION in C0 relative to p_ee0 — the discriminating term
-        p_pred = pg[:3] + Y @ np.asarray(m["tvec"], np.float64) \
+        p_pred = A @ (pg[:3] + Y @ np.asarray(m["tvec"], np.float64)) \
             + np.asarray(m["toff"], np.float64)
         p_gt = R_cv0.T @ (np.asarray(rb['ee_goal_pos_w'][idx], np.float64) - p_ee0)
         e_pos = float(np.linalg.norm(p_pred - p_gt))
@@ -834,8 +889,13 @@ class LumiPlaceImageDataset(BaseDataset):
             R_frame, self.action_param, self.action_frame, self.h_dt)
         # goal-coincidence target: the remaining transform at the anchor, in the output frame.
         remaining = remaining_to_goal(g['p_ee'][0], g['R_ee'][0], p_goal, R_goal, R_frame)
-        # ... valid ONLY where the horizon actually reaches the goal (see H_GOAL_INTEGRAL_TOL_M)
-        inreach = float(np.linalg.norm(g['p_ee'][-1] - p_goal) <= H_GOAL_INTEGRAL_TOL_M)
+        # ... valid ONLY where the horizon actually reaches the goal (see H_GOAL_INTEGRAL_TOL_M).
+        # Measured against the CLEAN GT goal `g['p_goal']`, NEVER the noised `p_goal` (§9.2):
+        # this asks whether the LABELS satisfy the constraint, which is a property of the
+        # trajectory, not of the scheduled-sampling draw. Against the noised goal a 15 mm
+        # perturbation vs a 5 mm tolerance zeroes the mask on ~99.6% of samples and silently
+        # deletes the loss.
+        inreach = float(np.linalg.norm(g['p_ee'][-1] - g['p_goal']) <= H_GOAL_INTEGRAL_TOL_M)
         extras = dict(
             h_goal_frame=F.astype(np.float32),                       # (3,3) F (with noise)
             h_goal_remaining=remaining.astype(np.float32),            # (6,)
@@ -847,23 +907,42 @@ class LumiPlaceImageDataset(BaseDataset):
     def _h_all_action_rows(self):
         """Action rows for EVERY train window — the normalizer must be fit over the exact
         tensors training sees (mirrors `_all_anchored_actions`). Pose-only sampler so the
-        image arrays are never sliced. Fit on the CLEAN rows: the scheduled-sampling noise is
-        15 mm / 1.5 deg, far inside the limits, and letting it move the normalizer would make
-        the fit depend on the RNG."""
+        image arrays are never sliced.
+
+        GOAL FRAMES ALSO FIT OVER **NOISED** ROWS (contract §9.5). The clean-only fit was wrong
+        by an amount that grows as the rows contract: a `delta`+`goal` row near the goal is
+        `p_goal - p_k`, a few mm, so the 15 mm scheduled-sampling perturbation DOMINATES it and
+        the terminal rows leave the fitted limits entirely — measured max |normalized train
+        action| = 2.48 in limits mode. `H_NORM_NOISE_DRAWS` fixed-seed draws per window are
+        appended to the clean rows, so the fit covers what training actually consumes and stays
+        deterministic (the seed is derived from the dataset seed and the window index; it does
+        NOT touch the per-sample augmentation RNG). `cam0` frames are untouched: their rows do
+        not depend on the goal at all."""
         keys = ['ee_pos_w', 'ee_quat_w', 'q7', 'cam_quat_cv',
                 'ee_goal_pos_w', 'ee_goal_quat_w', 'q7_goal', 'goal_rot_cam']
         pose_sampler = SequenceSampler(
             replay_buffer=self.replay_buffer, sequence_length=self.seq_len,
             pad_before=self.pad_before, pad_after=self.pad_after,
             keys=keys, episode_mask=self.train_mask)
+        # Gated on `self.augment` as well as on the knobs: a run with augmentation disabled never
+        # perturbs the goal frame, so widening its normalizer would be fitting noise nobody sees.
+        noisy = (self.action_frame == "goal" and H_NORM_NOISE_DRAWS > 0 and self.augment
+                 and (float(self.aug.get("goal_frame_noise_mm", 0.0) or 0.0) > 0.0
+                      or float(self.aug.get("goal_frame_noise_deg", 0.0) or 0.0) > 0.0))
         rows = []
         for idx in range(len(pose_sampler)):
             s = pose_sampler.sample_sequence(idx)
             g = self._h_window_geometry(s, self.pad_before)
             rows.append(self._h_build_rows(g)[0])
+            if noisy:
+                rng = np.random.default_rng([self.seed, 424242, idx])
+                for _ in range(H_NORM_NOISE_DRAWS):
+                    rows.append(self._h_build_rows(g, *self._h_goal_perturbation(rng))[0])
         out = np.concatenate(rows, axis=0)
-        cprint(f"[H] action normalizer fit over {len(rows)} windows x {self.action_rows} rows "
-               f"-> {out.shape}", "green")
+        cprint(f"[H] action normalizer fit over {len(pose_sampler)} windows x "
+               f"{self.action_rows} rows"
+               + (f" (+{H_NORM_NOISE_DRAWS} goal-noise draws each, §9.5)" if noisy else "")
+               + f" -> {out.shape}", "green")
         return out
 
     def _h_all_tcpcam(self):
@@ -1111,7 +1190,7 @@ class LumiPlaceImageDataset(BaseDataset):
 
     # ------------------------------------------------------------------ H sample assembly
 
-    def _h_frame_indices(self, anchor, sample_rng):
+    def _h_frame_indices(self, anchor, sample_rng, pad_start=0):
         """Timing augmentation (contract §5) -> (image indices, proprio indices, dt seconds).
 
         `obs_gap_frames ~ obs_gap_probs` over {0,1,2}: spacing of the obs IMAGES. 0 reproduces
@@ -1122,6 +1201,16 @@ class LumiPlaceImageDataset(BaseDataset):
         `dt` reports the TRUE image gap so the jitter is in-distribution, never a silent lie.
         Sub-100 ms jitter is NOT representable (images exist only at 10 Hz) — data-request item,
         do not fake it. Eval/export (augment off) => gap 1, lag 0 = nominal.
+
+        `pad_start` = the sampler's `sample_start_idx`: window slots BELOW it are PADDING that
+        `SequenceSampler` fills by repeating the episode's first frame. dt is therefore computed
+        from the EFFECTIVE indices `max(i, pad_start)` (contract §9.4): at an episode-start
+        anchor the two "obs images" are byte-identical duplicates, and reporting the nominal
+        100 ms there would be exactly the silent lie the key exists to prevent — the more so
+        because gap = 0 is a MODELLED failure mode (the observed duplicate-camera-frame bug), so
+        a lie here trains the model to expect parallax that a real stalled camera will not
+        deliver. Clipping also fixes the intermediate case honestly: gap 2 clipped to one real
+        frame reports 100 ms, not 200.
         """
         To = self.n_obs_steps
         if self.augment:
@@ -1138,16 +1227,26 @@ class LumiPlaceImageDataset(BaseDataset):
         assert min(img_idx + pro_idx) >= 0, (
             f"H window underflow: img={img_idx} pro={pro_idx} anchor={anchor} "
             f"(pad_before={self.pad_before})")
-        return img_idx, pro_idx, float(gap) / self.control_hz
+        eff = [max(int(i), int(pad_start)) for i in img_idx]
+        dt_true = float(eff[-1] - eff[0]) / max(1, To - 1) / self.control_hz
+        return img_idx, pro_idx, dt_true
 
-    def _h_sample_to_data(self, sample, ep_idx=None, sample_idx=0):
+    def _h_sample_to_data(self, sample, ep_idx=None, sample_idx=0, pad_start=0):
         """Build one H training sample: contract §4 obs dict + §3 action rows (+ supervision)."""
         anchor = self.pad_before
-        ep_rng = (np.random.default_rng([self.seed, 1000003, ep_idx])
-                  if ep_idx is not None else np.random.default_rng([self.seed, 1000003]))
-        sample_rng = np.random.default_rng([self.seed, 7777777, ep_idx or 0, sample_idx])
+        # EPOCH IS PART OF THE SEED (contract §9.4). Without it every sample's timing draw, goal
+        # noise and proprio DR is a fixed constant for the whole run — see `set_epoch`. Within an
+        # epoch the draw stays a pure function of (epoch, episode, sample), so it is reproducible
+        # and independent of worker count / shuffling.
+        ep = self.epoch
+        # ep_rng stays EPISODE-scoped (it drives `depth_episode_dropout`, whose semantics are
+        # "this episode's depth is unusable") but is no longer frozen: a fixed 10% of episodes
+        # being permanently depth-blind is memorisable, a resampled 10% is domain randomisation.
+        ep_rng = (np.random.default_rng([self.seed, 1000003, ep, ep_idx])
+                  if ep_idx is not None else np.random.default_rng([self.seed, 1000003, ep]))
+        sample_rng = np.random.default_rng([self.seed, 7777777, ep, ep_idx or 0, sample_idx])
 
-        img_idx, pro_idx, dt_true = self._h_frame_indices(anchor, sample_rng)
+        img_idx, pro_idx, dt_true = self._h_frame_indices(anchor, sample_rng, pad_start=pad_start)
         ii = np.asarray(img_idx)
         pi = np.asarray(pro_idx)
 
@@ -1203,10 +1302,21 @@ class LumiPlaceImageDataset(BaseDataset):
         # Constant maps that let the POLICY compose the ee_link goal (and the goal FRAME) from its
         # own predicted `panel_goal_cam` (+) `grasp_offset`, in C0 — see `panel_to_ee_goal_maps`.
         # Training-only: never an obs input, never in the ONNX graph.
+        #
+        # The place head's output lives in the camera frame of the MOST RECENT USED IMAGE (§9.3,
+        # index `i_img`), which under `image_lag_frames > 0` is NOT the anchor. The maps therefore
+        # carry `A = R_cv0.T @ R_cimg` and re-anchor the position from that camera; with lag 0
+        # (every eval/export sample) A is the identity and this reduces exactly to the anchor-frame
+        # form. Getting this wrong would rotate the composed goal frame by the camera's egomotion
+        # over one control step — the same error class §9.3 removes from the labels, re-introduced
+        # through the back door.
+        i_img = int(ii[-1])
+        R_cimg = quat_wxyz_to_rotmat(np.asarray(sample['cam_quat_cv'][i_img], np.float64))
         gc = panel_to_ee_goal_maps(
             g['R_cv0'].T @ quat_wxyz_to_rotmat(np.asarray(sample['tcp_quat_w'][anchor], np.float64)),
-            g['R_cv0'].T @ (np.asarray(sample['cam_pos_w'][anchor], np.float64) - g['p_ee'][0]),
+            g['R_cv0'].T @ (np.asarray(sample['cam_pos_w'][i_img], np.float64) - g['p_ee'][0]),
             sample['grasp_offset'][anchor], g['q7_goal'],
+            R_c0_from_cimg=g['R_cv0'].T @ R_cimg,
             invert_offset=getattr(self, 'grasp_offset_invert', GRASP_OFFSET_INVERT))
 
         # ---------------- augmentation ------------------------------------------------------
@@ -1254,21 +1364,36 @@ class LumiPlaceImageDataset(BaseDataset):
             'twist_hist': twist_hist,
         }
         assert set(obs) == set(H_OBS_KEYS), f"H obs keys drifted: {sorted(obs)}"
+        # ---------------- supervision ------------------------------------------------------
+        # PERCEPTION LABELS FOLLOW THE PIXELS (contract §9.3): every target of a head that reads
+        # ONLY image features is indexed at the IMAGE frames `ii`, never at the anchor/proprio
+        # indices. Under the live §5 augmentation (lag {0,1} @ [0.6,0.4]) ~40% of train samples
+        # otherwise supervise the heatmap/place/rail heads with labels one control frame AHEAD of
+        # the pixels they see — irreducible, camera-egomotion-scale label noise injected straight
+        # into the head that IS deploy's goal source. Those heads have no proprio path, so they
+        # cannot even in principle compensate for it.
+        #
+        # ACTION labels stay anchored AT THE ANCHOR (`anchor`), unchanged and bit-identical across
+        # every gap/lag draw — the action rows describe motion from the obs time forward, and
+        # re-indexing them would redefine the chunk. `phase_id`/`done` are anchor-time facts about
+        # the CONTROL state (which phase am I in, am I finished), not about the image, so they
+        # stay at the anchor too. Tests pin both invariants. (`i_img` == ii[-1], newest image.)
         out = {
             'obs': obs,
             'action': action,                                                    # (rows,7)
             # PRIMARY place-head target (§1.2b): the PANEL's target pose, camera-frame-ABSOLUTE.
             # It is grasp-offset-free (a scene property) AND it is identifiable, which `rail_a`
             # is not — the along-rail DoF is free by 0.19 m relative to the rail.
-            'panel_goal': sample['panel_goal_cam'][anchor].astype(np.float32),   # (6,)
+            # FRAME (§9.3): the camera that captured the MOST RECENT USED image, i.e. `ii[-1]`.
+            'panel_goal': sample['panel_goal_cam'][i_img].astype(np.float32),    # (6,)
             # AUX landmark grounding ONLY, and note the DIFFERENT CONVENTION: a TCP-anchored
             # delta, not a camera-absolute pose. Inter-convertible via `tcpcam`, never equal.
-            'rail_a': sample['rail_a_cam'][anchor].astype(np.float32),           # (6,)
-            'arm_kpts_uv': sample['arm_kpts_uv'][pi].astype(np.float32),         # (To,N,3)
-            'arm_kpts_cam': sample['arm_kpts_cam'][pi].astype(np.float32),       # (To,N,3)
+            'rail_a': sample['rail_a_cam'][i_img].astype(np.float32),            # (6,)
+            'arm_kpts_uv': sample['arm_kpts_uv'][ii].astype(np.float32),         # (To,N,3)
+            'arm_kpts_cam': sample['arm_kpts_cam'][ii].astype(np.float32),       # (To,N,3)
             'phase_id': sample['phase_id'][anchor].astype(np.int64).reshape(1),  # (1,)
             'done': sample['done'][anchor].astype(np.float32).reshape(1),        # (1,)
-            'h_gc_tvec': gc['tvec'], 'h_gc_toff': gc['toff'],
+            'h_gc_tvec': gc['tvec'], 'h_gc_toff': gc['toff'], 'h_gc_A': gc['A'],
             'h_gc_Ree': gc['R_ee'], 'h_gc_Rframe': gc['R_frame'],
         }
         out.update(extras)
@@ -1374,6 +1499,12 @@ class LumiPlaceImageDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
-        fn = self._h_sample_to_data if self.h_mode else self._sample_to_data
-        data = fn(sample, ep_idx=self._episode_of(idx), sample_idx=idx)
+        if self.h_mode:
+            # `sample_start_idx`: window slots below it are the sampler's front PADDING (frame 0
+            # repeated), which the dt-honesty rule needs to see (contract §9.4 / `_h_frame_indices`).
+            data = self._h_sample_to_data(
+                sample, ep_idx=self._episode_of(idx), sample_idx=idx,
+                pad_start=int(self.sampler.indices[idx][2]))
+        else:
+            data = self._sample_to_data(sample, ep_idx=self._episode_of(idx), sample_idx=idx)
         return dict_apply(data, torch.from_numpy)
