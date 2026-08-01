@@ -265,8 +265,18 @@ class DiTX(nn.Module):
         nn.init.constant_(self.input_emb.bias, 0) if self.input_emb.bias is not None else None
 
         # Initialize pos emb by normal distribution:
-        nn.init.normal_(self.pos_emb, std=0.02)       
-        # nn.init.constant_(self.pos_emb, 0) # not used 
+        nn.init.normal_(self.pos_emb, std=0.02)
+        # nn.init.constant_(self.pos_emb, 0) # not used
+
+        # ...and the CONDITIONING pos embed, allocated as zeros above and (until 2026-08-01) never
+        # initialized, unlike the action `pos_emb` two lines up. At zero, a conditioning key's
+        # tokens are separable only by content plus a shared per-key type embedding -- so the five
+        # `twist_hist` tokens (one shared Linear, one shared type ID) were ORDER-BLIND at init and
+        # the 50 Hz temporal profile that is the entire reason that key exists had to be learned
+        # into a zero table. Same for telling obs frame t from t-1 on every low-dim key, and for
+        # the frame-major RGB blocks. See docs/h_series_fix_wave.md §3.
+        if self.vis_cond_pos_embed is not None:
+            nn.init.normal_(self.vis_cond_pos_embed, std=0.02)
 
         # Initialize diffusion step encoder:
         for layer in self.flow_timestep_encoder:

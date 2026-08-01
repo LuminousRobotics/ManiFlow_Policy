@@ -1297,8 +1297,17 @@ class LumiPlaceImageDataset(BaseDataset):
 
         # ---------------- action rows + goal bookkeeping ------------------------------------
         g = self._h_window_geometry(sample, anchor)
+        # Its OWN counter-based stream, NOT `sample_rng` (contract §9.4 / fix_wave §4). The goal
+        # perturbation only fires on `action_frame == "goal"` arms, and drawing it from the shared
+        # stream shifted every draw AFTER this line -- depth DR, proprio DR, photometric aug -- so
+        # the goal arms trained on differently-augmented images than the cam0 arms. Measured: H0
+        # and H-delta were bit-identical at epoch 0 (loss_kpt 8.687776565551758) while H1 was not
+        # (8.687861). With a separate stream the 2x2 is exactly paired and only the mechanism under
+        # test differs. `_h_frame_indices` above is deliberately left on `sample_rng`: it draws
+        # identically in all four arms, so it does not break the pairing.
+        goal_rng = np.random.default_rng([self.seed, 8888888, ep, ep_idx or 0, sample_idx])
         dR, dp = ((None, None) if not self.augment
-                  else self._h_goal_perturbation(sample_rng))
+                  else self._h_goal_perturbation(goal_rng))
         action, extras = self._h_build_rows(g, dR, dp)
 
         # Constant maps that let the POLICY compose the ee_link goal (and the goal FRAME) from its

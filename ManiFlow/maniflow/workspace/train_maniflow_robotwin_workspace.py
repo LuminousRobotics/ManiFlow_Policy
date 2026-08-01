@@ -107,6 +107,9 @@ def _csv_log_epoch(output_dir, epoch, global_step, step_log):
               'loss_goal_int', 'goal_int_mm', 'goal_int_frac',
               'loss_term', 'goal_reach_frac',
               'loss_goal_cons', 'loss_rate', 'loss_rail_aux',
+              # `loss_rate` is a hinge on the excess over the driver cap, so 0 == executable;
+              # these two disambiguate "all feasible" from "one row barely over".
+              'rate_over_frac', 'rate_max_x_cap',
               'loss_phase', 'phase_acc', 'loss_done', 'self_frame_frac',
               'v_flow_pred_magnitude', 'v_ct_pred_magnitude',
               'train_action_mse_error', 'val_action_mse_error',

@@ -14,6 +14,59 @@ from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
 from maniflow.model.common.sample_util import *
 
+# ---------------------------------------------------------------------------------------------
+# H-series constraint TOLERANCES (contract §3.2, amended 2026-08-01 — docs/h_series_fix_wave.md)
+#
+# The action-space constraints below are computed on UNNORMALIZED rows (m, rad, m/s, rad/s), which
+# keeps their weighting independent of the dataset's velocity spread. But `F.smooth_l1_loss`'s
+# default beta=1.0 is quadratic for |r|<1 and EVERY residual we care about is <<1, so a 32 mm/dim
+# error landed at 0.5*0.032**2 = 5.1e-4 -- with weights picked as if the losses were O(1), the
+# three flagship constraints came to 0.0035% of `train_loss` (measured, 10-epoch smoke). They were
+# alive and inert.
+#
+# Fix: divide each residual by its DEPLOY TOLERANCE before the Huber. The loss then reads as
+# MULTIPLES OF SPEC -- quadratic (fine polish) inside 1x spec, robust-linear (bounded gradient)
+# beyond it, which is what Huber was chosen for and never delivered. `loss_* == 1.0` means
+# "at spec". Inter-dimension weighting now comes from the accuracy spec instead of the accident
+# that 1 m and 1 rad are both "1" in SI (that accident down-weighted omega_x by 67,774x vs a
+# normalized-space constraint; spread across dims was 350x).
+H_TOL_POS_M = 0.005            # 5 mm  -- deploy position spec
+H_TOL_ROT_RAD = 0.0087266462   # 0.5 deg -- deploy orientation spec
+H_TOL_LIN_MPS = 0.1            # DRIVER_LIN_MPS -- linear rate cap
+H_TOL_ANG_RADPS = 0.3          # DRIVER_ANG_RADPS -- angular rate cap
+H_TOL_DELTA_TICK_M = 0.010     # per-tick delta clamp (10 mm @ 10 Hz)
+H_TOL_DELTA_TICK_RAD = 0.029670597  # per-tick delta clamp (1.7 deg @ 10 Hz)
+
+
+def _h_tol_vec(kind, control_hz, device, dtype):
+    """(7,) per-dim tolerance for a `[v(3)|w(3)|dJ7]` or `[p(3)|rotvec(3)|dJ7]` row.
+
+    `kind`:
+      'pose'       -- a POSITION-like 6/7-vector (goal integral, goal consistency): pos/rot spec.
+      'term_twist' -- terminal twist row: "spec per control tick", i.e. the twist that would move
+                      exactly one tolerance in one interval. Settling to <1 means the last row
+                      cannot carry the TCP further than spec in a tick.
+      'term_delta' -- terminal delta row: the pose spec directly.
+      'rate_twist' -- row-to-row twist jump, against the DRIVER rate caps.
+      'rate_delta' -- row-to-row delta jump, against the per-tick clamp.
+    dJ7 (dim 6) is an angle (delta) or an angular rate (twist) and takes the rotation tolerance
+    of the same kind in every case.
+    """
+    if kind == 'pose':
+        p, r = H_TOL_POS_M, H_TOL_ROT_RAD
+    elif kind == 'term_twist':
+        p, r = H_TOL_POS_M * control_hz, H_TOL_ROT_RAD * control_hz
+    elif kind == 'term_delta':
+        p, r = H_TOL_POS_M, H_TOL_ROT_RAD
+    elif kind == 'rate_twist':
+        p, r = H_TOL_LIN_MPS, H_TOL_ANG_RADPS
+    elif kind == 'rate_delta':
+        p, r = H_TOL_DELTA_TICK_M, H_TOL_DELTA_TICK_RAD
+    else:
+        raise ValueError(f"unknown tolerance kind {kind!r}")
+    return torch.tensor([p, p, p, r, r, r, r], device=device, dtype=dtype)
+
+
 class ManiFlowTransformerImagePolicy(BasePolicy):
     def __init__(self, 
              shape_meta: dict,
@@ -1601,16 +1654,40 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             if self.action_rate_weight > 0.0:
                 # Executability: the converter MEASURES per-step rates but deliberately does not
                 # clamp labels (clamping breaks the anchored/goal geometry). Feasibility is
-                # enforced HERE (smoothness) and deploy-side by saturation + k=1 replan.
+                # enforced HERE and deploy-side by saturation + k=1 replan.
+                #
+                # This was `(d*d).sum(-1).mean()` on RAW m/s -- i.e. a SMOOTHNESS prior wearing an
+                # "executability" label, minimised by a chunk that does not move at all, and so it
+                # fought the very progress the BC labels demand. At 0.05 weight on raw units it was
+                # 0.0074% of the objective while the smoke's delta arms exceeded the driver's linear
+                # cap on 100% of steps -- it could not guard anything. Two changes (fix_wave §2):
+                #   1. jumps are expressed in units of the DRIVER's own cap, so 1.0 == "a row-to-row
+                #      jump equal to the full driver range" -- exactly what eval's
+                #      `frac_steps_over_lin`/`_over_ang` count;
+                #   2. it is now a HINGE on the EXCESS over that cap. A chunk the driver can
+                #      actually execute costs ZERO (no smoothness tax on legitimate motion); only
+                #      infeasible motion is penalised, and the Huber keeps the gradient bounded so
+                #      a wildly-infeasible delta chunk cannot drown the BC objective (naive
+                #      rescaling without the hinge projected to 22x weighted on H1-delta).
                 seq = rows
                 if self.k0_row_structurally_zero:
                     # delta+cam0: the k=0 row is not an OUTPUT but it is real at EXECUTION time
                     # (the chunk starts at the anchor), so penalise a jump off it.
                     seq = torch.cat([torch.zeros_like(rows[:, :1]), rows], dim=1)
-                d = seq[:, 1:] - seq[:, :-1]
-                lrate = (d * d).sum(-1).mean()
+                d = (seq[:, 1:] - seq[:, :-1]).abs() / _h_tol_vec(
+                    'rate_delta' if self.action_param == 'delta' else 'rate_twist',
+                    self.control_hz, rows.device, rows.dtype)
+                excess = (d - 1.0).clamp(min=0.0)
+                lrate = F.smooth_l1_loss(excess, torch.zeros_like(excess),
+                                         reduction='none').mean()
                 loss = loss + self.action_rate_weight * lrate
                 h_log['loss_rate'] = float(lrate.item())
+                with torch.no_grad():
+                    # The quantity the deploy gate actually cares about: what fraction of
+                    # (row, dim) pairs the driver could not follow. `loss_rate` can sit near 0
+                    # from many tiny violations OR one huge one; this separates them.
+                    h_log['rate_over_frac'] = float((d > 1.0).float().mean().item())
+                    h_log['rate_max_x_cap'] = float(d.max().item())
 
             if self.action_frame == "goal":
                 pred6 = self._h_goal_integral(rows)
@@ -1638,7 +1715,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 ok_int = bool(n_int.item() > 0.0)
                 if self.goal_integral_weight > 0.0:
                     if ok_int:
-                        li_el = F.smooth_l1_loss(pred6, tgt6, reduction='none').mean(-1)
+                        # In units of the deploy spec (5 mm / 0.5 deg), so li == 1.0 means the
+                        # composed chunk lands exactly one tolerance away from the goal, and the
+                        # Huber is LINEAR (bounded gradient) while the error is above spec.
+                        tol6 = _h_tol_vec('pose', self.control_hz, rows.device, rows.dtype)[:6]
+                        li_el = F.smooth_l1_loss(pred6 / tol6, tgt6 / tol6,
+                                                 reduction='none').mean(-1)
                         li = (li_el * m_int).sum() / n_int
                         loss = loss + self.goal_integral_weight * li
                         h_log['loss_goal_int'] = float(li.item())
@@ -1659,7 +1741,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                     # data. Same clean-goal reach mask as the integral (§9.2).
                     n_reach = m_reach.sum()
                     if n_reach.item() > 0.0:
-                        lt_el = F.smooth_l1_loss(rows[:, -1], torch.zeros_like(rows[:, -1]),
+                        # "Settled" in units of spec-per-tick for twist (a last row below 1 cannot
+                        # carry the TCP further than 5 mm / 0.5 deg in one 100 ms interval) and of
+                        # the pose spec for delta. Same reading as the integral: 1.0 == at spec.
+                        tolt = _h_tol_vec(
+                            'term_delta' if self.action_param == 'delta' else 'term_twist',
+                            self.control_hz, rows.device, rows.dtype)
+                        lt_el = F.smooth_l1_loss(rows[:, -1] / tolt,
+                                                 torch.zeros_like(rows[:, -1]),
                                                  reduction='none').mean(-1)
                         lt = (lt_el * m_reach).sum() / n_reach
                         loss = loss + self.terminal_zero_weight * lt
@@ -1669,7 +1758,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 if h_ref['gc_target'] is not None and self.goal_consistency_weight > 0.0:
                     # ties row 0 to the model's OWN goal estimate -> the action loss becomes a
                     # supervisor of the place head (the anti-shortcut mechanism)
-                    lgc = F.smooth_l1_loss(rows[:, 0, 0:6], h_ref['gc_target'][:Bf])
+                    tolg = _h_tol_vec('pose', self.control_hz, rows.device, rows.dtype)[:6]
+                    lgc = F.smooth_l1_loss(rows[:, 0, 0:6] / tolg,
+                                           h_ref['gc_target'][:Bf] / tolg)
                     loss = loss + self.goal_consistency_weight * lgc
                     h_log['loss_goal_cons'] = float(lgc.item())
                 h_log['self_frame_frac'] = h_ref['self_frame_frac']
