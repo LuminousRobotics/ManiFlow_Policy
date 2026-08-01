@@ -73,6 +73,25 @@ DEFAULT_AUGMENTATION = {
     "photo_blur_p": 0.0,             # prob of a mild gaussian blur
     "photo_noise": 0.0,              # gaussian pixel noise std (image in [0,1])
     "photo_erase_p": 0.0,            # prob of a random-erasing box (up to 2 boxes)
+    # ---- H-series (v10) timing augmentation (contract §5). Defaults = NOMINAL (no jitter),
+    # so a config that does not set them reproduces the un-augmented 100 ms / no-lag timing.
+    # `obs_gap_frames ~ obs_gap_probs` over {0,1,2}: how many control frames back the PREVIOUS
+    # obs image is taken. 0 reproduces the observed duplicate-camera-frame failure; 1 = nominal
+    # 100 ms; 2 = 200 ms. `image_lag_frames ~ image_lag_probs` over {0,1}: both obs images are
+    # taken that many frames BEFORE the action anchor while proprio stays at the anchor (the
+    # measured 100-150 ms observation staleness — joint states arrive fast, images do not).
+    # `dt` reports the TRUE gap, so the jitter is in-distribution instead of a silent lie.
+    "obs_gap_probs": None,           # None => [0,1,0] (always nominal 1 frame)
+    "image_lag_probs": None,         # None => [1,0]   (always 0 lag)
+    # ---- H-series per-key proprio DR (contract §4.3). Noise is PHYSICAL and lives here;
+    # per-key block MASKING lives in the policy (it needs a learned mask token).
+    "proprio_noise_joint_deg": 0.0,  # gaussian on agent_pos joints [deg]
+    "proprio_noise_twist_frac": 0.0, # multiplicative gaussian on twist / twist_hist [fraction]
+    "proprio_noise_ego_mm": 0.0,     # gaussian on tcp_egomotion translation [mm]
+    # ---- H1 scheduled sampling on the OUTPUT frame (contract §3.3). The dataset supplies the
+    # GT goal + noise; the POLICY does the anneal toward its own (detached) place-head goal.
+    "goal_frame_noise_mm": 0.0,
+    "goal_frame_noise_deg": 0.0,
 }
 
 
@@ -135,6 +154,259 @@ def _rv_to_R(rv):
     return np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * (K @ K)
 
 
+# ======================================================================================
+# H-series (v10) geometry — BYTE-PARITY TWINS of the pipeline's
+# `policy-training-pipeline/src/converter/transforms.py`.
+#
+# WHY twins and not an import: the fork ships into the training container as a COPY of
+# this file; the converter runs in a different container. There is no shared package, so
+# the only way to guarantee the labels the fork builds are the labels the converter
+# documented is to duplicate the math and PIN IT WITH A TEST. `tests/test_h_geometry_parity.py`
+# asserts agreement to 1e-9 on a shared random seed against the pipeline source. If you
+# touch anything below, touch the converter too, and run that test.
+#
+# Naming is deliberately identical to the converter's so a diff is trivial to eyeball.
+# ======================================================================================
+
+# Public aliases so the twins below read exactly like the converter's module.
+quat_wxyz_to_rotmat = _quat_wxyz_to_rotmat
+rotmat_to_rotvec = _rotmat_to_rotvec
+rotvec_to_rotmat = _rv_to_R
+
+# ee_link is +Y of tcp_link in the link_7/tcp frame (URDF A-000022.xacro, verified to 2e-7 m).
+# ee_link is J7-INVARIANT (fixed w.r.t. gripper_frame), which is what makes a 6-DoF ee_link
+# delta/twist executable by J1..J6 alone; the wrist camera is on link_6_extension and is
+# therefore also J7-invariant, so ee_link motion expressed in the camera frame is fully
+# decoupled from J7. J7 becomes a separate POSITIONAL channel. Ground truth (goals, place
+# error, keypoints) stays in tcp_link — ee_link is ONLY the action/proprio frame.
+EE_TCP_Y_OFFSET_M = 0.0595178643762819
+
+
+def rotz(angle) -> np.ndarray:
+    """(3,3) rotation about Z by `angle` radians."""
+    c, s = np.cos(float(angle)), np.sin(float(angle))
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def ee_from_tcp(p_tcp, R_tcp, q7):
+    """(tcp_link pose, joint-7 angle) -> ee_link pose. Exact inverse: `tcp_from_ee`."""
+    R_tcp = np.asarray(R_tcp, dtype=np.float64)
+    p_tcp = np.asarray(p_tcp, dtype=np.float64)
+    p_ee = p_tcp + R_tcp @ np.array([0.0, EE_TCP_Y_OFFSET_M, 0.0])
+    R_ee = R_tcp @ rotz(-float(q7))
+    return p_ee, R_ee
+
+
+def tcp_from_ee(p_ee, R_ee, q7):
+    """ee_link pose + joint-7 angle -> tcp_link pose (exact inverse of `ee_from_tcp`).
+    This is the transform the DEPLOY node needs: the policy acts on ee_link, but the
+    suction cup (and therefore the place goal) lives at tcp_link."""
+    R_ee = np.asarray(R_ee, dtype=np.float64)
+    p_ee = np.asarray(p_ee, dtype=np.float64)
+    R_tcp = R_ee @ rotz(float(q7))
+    p_tcp = p_ee - R_tcp @ np.array([0.0, EE_TCP_Y_OFFSET_M, 0.0])
+    return p_tcp, R_tcp
+
+
+def goal_frame_rotation(R_cv0, goal_rotvec_cam) -> np.ndarray:
+    """H1 output frame: the camera frame at the anchor, rotated by the goal's orientation.
+    Actions expressed in this frame rotate WITH the goal estimate -> goal equivariance."""
+    return np.asarray(R_cv0, dtype=np.float64) @ rotvec_to_rotmat(goal_rotvec_cam)
+
+
+def compose_rotvecs(rotvecs) -> np.ndarray:
+    """Compose a sequence of rotation vectors (applied in order) -> single rotation vector.
+    Angular-velocity rows integrate by COMPOSITION (prod exp(w_k dt)), not summation."""
+    R = np.eye(3)
+    for rv in rotvecs:
+        R = rotvec_to_rotmat(rv) @ R
+    return rotmat_to_rotvec(R)
+
+
+def anchored_delta(p0, R0, p_k, R_k, R_cv0) -> np.ndarray:
+    """Pose at step k RELATIVE to the anchor pose, expressed in the frame `R_cv0`.
+        dp = R_cv0.T @ (p_k - p0);  dR = R_cv0.T @ (R_k @ R0.T) @ R_cv0
+    Inverse: p_k = p0 + R_cv0 @ dp; R_k = (R_cv0 @ rotvec_to_rotmat(drv) @ R_cv0.T) @ R0."""
+    dp = np.asarray(R_cv0, np.float64).T @ (
+        np.asarray(p_k, np.float64) - np.asarray(p0, np.float64))
+    dR_cam = np.asarray(R_cv0, np.float64).T @ (
+        np.asarray(R_k, np.float64) @ np.asarray(R0, np.float64).T) @ np.asarray(R_cv0, np.float64)
+    return np.concatenate([dp, rotmat_to_rotvec(dR_cam)])
+
+
+def twist_rows_from_poses(p_seq, R_seq, R_frame, dt: float) -> np.ndarray:
+    """Per-interval twist rows for a pose sequence, expressed in ONE fixed frame.
+
+    Returns (H-1, 6) float64 rows `[v(3) m/s, omega(3) rad/s]` where
+        v_k     = R_frame.T @ (p_k - p_{k-1}) / dt
+        omega_k = rotvec( R_frame.T @ (R_k @ R_{k-1}.T) @ R_frame ) / dt
+    Position integrates EXACTLY (single fixed frame): sum(v_k*dt) == R_frame.T @ (p_last - p_0).
+    Rotation integrates by composition (see `compose_rotvecs`)."""
+    p_seq = np.asarray(p_seq, dtype=np.float64)
+    R_seq = np.asarray(R_seq, dtype=np.float64)
+    R_frame = np.asarray(R_frame, dtype=np.float64)
+    rows = np.empty((len(p_seq) - 1, 6), dtype=np.float64)
+    for k in range(1, len(p_seq)):
+        rows[k - 1, :3] = R_frame.T @ (p_seq[k] - p_seq[k - 1]) / dt
+        dR = R_frame.T @ (R_seq[k] @ R_seq[k - 1].T) @ R_frame
+        rows[k - 1, 3:] = rotmat_to_rotvec(dR) / dt
+    return rows
+
+
+def remaining_to_goal(p_k, R_k, p_goal, R_goal, R_frame) -> np.ndarray:
+    """H1 `delta`+`goal` row: the transform from pose k TO the goal, in `R_frame`.
+    Contracts to zero at the goal by construction — the whole point of the goal-frame
+    parameterization. Inverse: `pose_from_remaining`."""
+    return anchored_delta(p_k, R_k, p_goal, R_goal, R_frame)
+
+
+def pose_from_remaining(p_goal, R_goal, u, R_frame):
+    """Inverse of `remaining_to_goal` — reconstruct pose k from the goal and the row."""
+    u = np.asarray(u, dtype=np.float64)
+    R_frame = np.asarray(R_frame, dtype=np.float64)
+    p_k = np.asarray(p_goal, dtype=np.float64) - R_frame @ u[:3]
+    R_k = (R_frame @ rotvec_to_rotmat(-u[3:]) @ R_frame.T) @ np.asarray(R_goal, dtype=np.float64)
+    return p_k, R_k
+
+
+# ---------------------------------------------------------------- H action space (contract §3)
+# `action_dim = 7` always: [6-DoF ee_link part | dJ7]. Two orthogonal knobs give the locked 2x2.
+# Row COUNT differs per mode because of what is structurally zero:
+#   twist+cam0 (H0)       15 rows  w_k, k=1..15   (no zero row exists)
+#   twist+goal (H1)       15 rows  w_k, k=1..15   (w_15 -> 0 settle + integral constraint)
+#   delta+cam0 (H-delta)  15 rows  a_k, k=1..15   (a_0 == 0 identically -> prepended at EXPORT)
+#   delta+goal (H1-delta) 16 rows  u_k, k=0..15   (u_15 -> 0; u_0 = remaining transform)
+H_ACTION_PARAMS = ("twist", "delta")
+H_ACTION_FRAMES = ("cam0", "goal")
+H_ACTION_DIM = 7
+
+# The H observation dict (contract §4). NOTE what is absent and why:
+#   - no `prev_action`  : the free-run collapse verdict (chained deltas are the copycat channel)
+#   - no `goal_prior`   : G0 verdict (an input goal latch gets ignored / shortcut)
+#   - no `suction`      : always-on during place => zero variance => dead dimension
+#   - no goal FRAME     : the goal frame is an OUTPUT coordinate system, never an input token
+H_OBS_KEYS = ('head_cam', 'depth_cam', 'agent_pos', 'task', 'grasp_off',
+              'ego', 'twist', 'tcpcam', 'dt', 'twist_hist')
+
+# Zarr keys the H MODEL consumes. Fail-loud list: the F-series lost a whole run because
+# `arm_kpts_*` were silently absent from buffer_keys (the heads trained against nothing).
+# Never make this soft. `prev_action` is deliberately NOT here — v10 retains it in the zarr
+# for eval/normalizer compat but it is not a model input (free-run collapse verdict).
+H_REQUIRED_ZARR_KEYS = (
+    'head_camera', 'depth',
+    'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w', 'cam_quat_cv',
+    'agent_pos', 'task',
+    'arm_kpts_uv', 'arm_kpts_cam',
+    'goal_pos_cam', 'goal_rot_cam',
+    'ee_pos_w', 'ee_quat_w', 'q7',
+    'ee_goal_pos_w', 'ee_goal_quat_w', 'q7_goal',
+    'rail_a_cam', 'grasp_offset',
+    'tcp_egomotion', 'tcp_twist', 'twist_hist',
+    'phase_id', 'done',
+)
+
+# Anchors whose horizon does NOT reach the segment end make the goal-coincidence integral
+# constraint (contract §3.2) mathematically FALSE: sum(v_k*dt) == p_15 - p_0, which only equals
+# the remaining transform p_G - p_0 when p_15 == p_G. Applying it anyway would inject an error
+# equal to the un-covered distance (>150mm early in a descent). We therefore ship a per-sample
+# `h_goal_inreach` mask and apply the integral loss only where the constraint holds. Deliberate
+# addition to §3.2 (no new config knob) — documented in the H report.
+H_GOAL_INTEGRAL_TOL_M = 0.005      # 5 mm == the terminal precision target
+
+
+def h_action_rows(action_param: str, action_frame: str, pose_horizon: int) -> int:
+    """Number of PREDICTED rows for a mode (contract §3 table). `pose_horizon` = H poses."""
+    assert action_param in H_ACTION_PARAMS, action_param
+    assert action_frame in H_ACTION_FRAMES, action_frame
+    if action_param == "delta" and action_frame == "goal":
+        return int(pose_horizon)            # k = 0..H-1
+    return int(pose_horizon) - 1            # k = 1..H-1
+
+
+def build_h_action_rows(p_ee, R_ee, q7, p_goal, R_goal, q7_goal,
+                        R_frame, action_param, action_frame, dt):
+    """Contract §3 action rows for ONE sample. All poses are **ee_link**, world frame.
+
+    p_ee (H,3), R_ee (H,3,3), q7 (H,) on the control grid starting AT THE ANCHOR (index 0 ==
+    the sample's obs time). (p_goal, R_goal, q7_goal) = the episode-constant ee_link goal.
+    `R_frame` = the expression frame: R_cv0 for `cam0`, R_g (goal frame) for `goal`.
+
+    Returns (rows, 7) float64: [..6-DoF.., dJ7].
+
+    dJ7 is POSITIONAL in every mode (J7's Maxon is on a position service — a "J7 velocity"
+    would just be re-integrated downstream). Per contract §3 it depends on the FRAME only:
+        cam0: dj7_k = q7[k] - q7[0]          (progress from the anchor)
+        goal: dj7_k = q7_goal - q7[k]        (remaining to the goal, contracts to 0)
+    """
+    p_ee = np.asarray(p_ee, dtype=np.float64)
+    R_ee = np.asarray(R_ee, dtype=np.float64)
+    q7 = np.asarray(q7, dtype=np.float64).reshape(-1)
+    H = len(p_ee)
+    assert R_ee.shape == (H, 3, 3) and q7.shape == (H,), (R_ee.shape, q7.shape)
+
+    if action_param == "twist":
+        six = twist_rows_from_poses(p_ee, R_ee, R_frame, dt)                    # (H-1,6)
+        ks = np.arange(1, H)
+    elif action_frame == "cam0":                                               # delta + cam0
+        six = np.stack([anchored_delta(p_ee[0], R_ee[0], p_ee[k], R_ee[k], R_frame)
+                        for k in range(1, H)])                                  # (H-1,6)
+        ks = np.arange(1, H)
+    else:                                                                      # delta + goal
+        six = np.stack([remaining_to_goal(p_ee[k], R_ee[k], p_goal, R_goal, R_frame)
+                        for k in range(H)])                                     # (H,6)
+        ks = np.arange(0, H)
+
+    if action_frame == "cam0":
+        dj7 = q7[ks] - q7[0]
+    else:
+        dj7 = float(q7_goal) - q7[ks]
+    return np.concatenate([six, dj7.reshape(-1, 1)], axis=1)
+
+
+def rail_to_ee_goal_maps(R_tcp0_cam, ee_minus_tcp_cam, grasp_offset, q7_goal,
+                         invert_offset: bool = True):
+    """Precompute the (tiny) constant maps that turn a PREDICTED `rail_a_cam` into the ee_link
+    goal + goal frame, all expressed in the camera frame at the anchor ("C0").
+
+    WHY this lives in the dataset: the actor composes `goal = rail_a (+) grasp_offset` (contract
+    §4 / plan §2.2), but the policy only sees NORMALIZED tokens — it has no access to the raw
+    current TCP orientation `R_tcp0` needed for the composition. These four constants make the
+    policy-side composition three matmuls, exactly and differentiably, with no new obs input.
+
+    Derivation. Let X = exp(rail_a_cam[3:]) and r_p = rail_a_cam[:3], so
+        R_cv0.T @ R_railA = X @ R_tcp0_cam            and   R_cv0.T @ (p_railA - p_tcp0) = r_p.
+    The panel must LAND on rail_a, i.e. T_world_panel == T_world_railA, and grasp_offset is
+    T_tcp_panel, so  T_world_tcpgoal = T_world_railA @ inv(T_tcp_panel):
+        R_gt = R_railA @ R_off.T ,  p_gt = p_railA - R_railA @ R_off.T @ p_off
+    then ee_link (contract §0):
+        R_ge = R_gt @ Rz(-q7_goal) ,  p_ge = p_gt + R_gt @ [0, +Y, 0]
+    Pushing through into C0 and re-anchoring the position at p_ee0 gives
+        p_goal_ee (in C0, rel. p_ee0) = r_p + X @ tvec - ee_minus_tcp_cam
+        R_goal_ee (in C0)             = X @ R_ee
+        goal FRAME (in C0)            = X @ R_frame          [ == exp(goal_rot_cam) ]
+    `invert_offset=False` selects the alternate convention T_world_railA @ T_tcp_panel; which
+    one the producer used is PROBED at dataset init (`_probe_grasp_offset_convention`) and the
+    mismatch fails loud.
+    """
+    R_tcp0_cam = np.asarray(R_tcp0_cam, dtype=np.float64)
+    ee_minus_tcp_cam = np.asarray(ee_minus_tcp_cam, dtype=np.float64).reshape(3)
+    go = np.asarray(grasp_offset, dtype=np.float64).reshape(7)
+    p_off, R_off = go[:3], quat_wxyz_to_rotmat(go[3:])
+    if invert_offset:
+        Ct = R_tcp0_cam @ R_off.T          # C0 rotation part of R_cv0.T @ R_gt, right of X
+        c1 = -(Ct @ p_off)                 # C0 translation part, right of X
+    else:
+        Ct = R_tcp0_cam @ R_off
+        c1 = R_tcp0_cam @ p_off
+    tvec = c1 + Ct @ np.array([0.0, EE_TCP_Y_OFFSET_M, 0.0])
+    return {
+        "tvec": tvec.astype(np.float32),                        # (3,)
+        "eeoff": ee_minus_tcp_cam.astype(np.float32),           # (3,)
+        "R_ee": (Ct @ rotz(-float(q7_goal))).astype(np.float32),   # (3,3)
+        "R_frame": (Ct @ R_tcp0_cam.T).astype(np.float32),      # (3,3)
+    }
+
+
 class LumiPlaceImageDataset(BaseDataset):
     def __init__(self,
                  zarr_path,
@@ -150,6 +422,12 @@ class LumiPlaceImageDataset(BaseDataset):
                  depth_band_edges=None,      # meters; N edges -> N-1 channels (bands mode)
                  depth_band_soft=DEPTH_BAND_SOFT,
                  use_depth=True,             # C2-rgb control arm: no depth stream at all
+                 # ---- H-series (v10) action space + timing (contract §3/§4/§5).
+                 # action_param=None keeps the v3 ANCHORED-TCP behaviour byte-for-byte.
+                 action_param=None,          # None (v3 legacy) | "twist" | "delta"
+                 action_frame="cam0",        # "cam0" | "goal"
+                 n_obs_steps=2,              # obs frames; needed to derive the timing padding
+                 control_hz=10.0,            # control-grid rate -> Delta t for twist rows
                  **kwargs):
         super().__init__()
         self.task_name = task_name
@@ -167,17 +445,44 @@ class LumiPlaceImageDataset(BaseDataset):
                f'{depth_input if self.use_depth else "OFF"}, '
                f'{self.depth_channels}ch) from {zarr_path}', 'green')
 
-        buffer_keys = ['head_camera', 'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w',
-                       'cam_quat_cv', 'prev_action', 'gravity_cam', 'goal_pos_cam',
-                       'goal_rot_cam', 'task']
-        if self.use_depth:
-            buffer_keys.insert(1, 'depth')
-        # F-series: load rail/tube keypoint targets if the zarr has them (v8+; back-compat with v7).
+        # --------------------------------------------------------------- H-series mode switch
+        self.action_param = action_param
+        self.action_frame = str(action_frame)
+        self.h_mode = action_param is not None
+        self.n_obs_steps = int(n_obs_steps)
+        self.control_hz = float(control_hz)
+        self.h_dt = 1.0 / self.control_hz
+        if self.h_mode:
+            assert action_param in H_ACTION_PARAMS, f"action_param={action_param!r}"
+            assert self.action_frame in H_ACTION_FRAMES, f"action_frame={action_frame!r}"
+            assert self.use_depth and depth_input == "xyz", (
+                "H requires the xyz point-map (PointNet K tokens + 3D-aware RGB tokens + "
+                f"kpt z-fusion all read it); got use_depth={use_depth} depth_input={depth_input}")
+
         _zk = set(zarr.open(str(zarr_path), mode='r')['data'].keys())
-        for _k in ('arm_kpts_uv', 'arm_kpts_cam', 'agent_pos'):
-            if _k in _zk:
-                buffer_keys.append(_k)
-        self.has_agent_pos = 'agent_pos' in _zk
+        if self.h_mode:
+            # FAIL LOUD on a missing key. The F-series lost an entire run to `arm_kpts_*`
+            # silently absent from buffer_keys (the heads trained against nothing and the
+            # loss looked "fine"). Never soften this into a hasattr/back-compat loop.
+            missing = [k for k in H_REQUIRED_ZARR_KEYS if k not in _zk]
+            if missing:
+                raise KeyError(
+                    f"H-series (action_param={action_param}) requires converter v10 "
+                    f"(CONVERTER_VERSION 2.4.0) keys; zarr at {zarr_path} is MISSING {missing}. "
+                    f"Present: {sorted(_zk)}")
+            buffer_keys = list(H_REQUIRED_ZARR_KEYS)
+            self.has_agent_pos = True
+        else:
+            buffer_keys = ['head_camera', 'tcp_pos_w', 'tcp_quat_w', 'cam_pos_w',
+                           'cam_quat_cv', 'prev_action', 'gravity_cam', 'goal_pos_cam',
+                           'goal_rot_cam', 'task']
+            if self.use_depth:
+                buffer_keys.insert(1, 'depth')
+            # F-series: load rail/tube keypoint targets if present (v8+; back-compat with v7).
+            for _k in ('arm_kpts_uv', 'arm_kpts_cam', 'agent_pos'):
+                if _k in _zk:
+                    buffer_keys.append(_k)
+            self.has_agent_pos = 'agent_pos' in _zk
         self.replay_buffer = ReplayBuffer.copy_from_path(zarr_path, keys=buffer_keys)
 
         # C2 "xyz" point-map mode: unproject each depth pixel to metric camera-frame
@@ -219,11 +524,44 @@ class LumiPlaceImageDataset(BaseDataset):
         cprint(f'Validation ratio: {val_ratio}', 'yellow')
         train_mask = downsample_mask(mask=train_mask, max_n=max_train_episodes, seed=seed)
 
+        # ------------------------------------------------- H window geometry (contract §3/§5)
+        # v3 semantics: the sampler window IS the action chunk (`horizon` rows, anchor at
+        # pad_before). H semantics differ: `horizon` is the number of POSES starting AT the
+        # anchor (H=16 -> 15 executable rows), and the timing augmentation needs image frames
+        # BEFORE the anchor. So the window is longer than the chunk:
+        #     pad_before_eff = max_image_lag + max_obs_gap * (n_obs_steps - 1)   (= 3 for To=2)
+        #     sequence_length = pad_before_eff + pose_horizon                    (= 19 for H=16)
+        # The support of the timing jitter is FIXED by contract §5 ({0,1,2} gap, {0,1} lag), so
+        # the padding does not depend on the probability values -> train and val windows are
+        # identical geometry regardless of augmentation settings (the normalizer must be fit
+        # over the exact rows training sees).
+        self.h_max_gap = 2
+        self.h_max_lag = 1
+        self.pose_horizon = int(horizon)
+        if self.h_mode:
+            self.action_rows = h_action_rows(
+                self.action_param, self.action_frame, self.pose_horizon)
+            h_obs_pad = self.h_max_lag + self.h_max_gap * (self.n_obs_steps - 1)
+            pad_before = max(int(pad_before), h_obs_pad)
+            # Let EVERY frame be an anchor: the terminal frames are exactly where the settle
+            # rows (twist -> 0 / u -> 0) and done==1 live, and dropping them would delete the
+            # terminal-precision supervision. SequenceSampler pads by repeating the last frame,
+            # which IS the settle semantics (a stationary tool tip).
+            pad_after = max(int(pad_after), self.pose_horizon - 1)
+            seq_len = pad_before + self.pose_horizon
+            cprint(f"[H] action={self.action_param}/{self.action_frame} rows={self.action_rows} "
+                   f"dim={H_ACTION_DIM} | poses={self.pose_horizon} window={seq_len} "
+                   f"anchor={pad_before} pad_after={pad_after} dt={self.h_dt:.3f}s", "green")
+        else:
+            self.action_rows = self.pose_horizon
+            seq_len = int(horizon)
+
         self.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, sequence_length=horizon,
+            replay_buffer=self.replay_buffer, sequence_length=seq_len,
             pad_before=pad_before, pad_after=pad_after, episode_mask=train_mask)
         self.train_mask = train_mask
         self.horizon = horizon
+        self.seq_len = seq_len
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.seed = seed
@@ -250,10 +588,84 @@ class LumiPlaceImageDataset(BaseDataset):
         self.train_episodes_num = np.sum(train_mask)
         self.val_episodes_num = np.sum(val_mask)
 
+        # H timing-aug distributions, validated once here (a bad prob vector must not surface
+        # as a per-sample numpy error inside a DataLoader worker).
+        self.obs_gap_probs = self._h_probs(aug.get("obs_gap_probs"), 3, [0.0, 1.0, 0.0])
+        self.image_lag_probs = self._h_probs(aug.get("image_lag_probs"), 2, [1.0, 0.0])
+        if self.h_mode:
+            cprint(f"[H] timing aug: obs_gap_probs={self.obs_gap_probs} "
+                   f"image_lag_probs={self.image_lag_probs} (eval/export = gap 1, lag 0)", "green")
+            self.grasp_offset_invert = self._probe_grasp_offset_convention()
+
+    @staticmethod
+    def _h_probs(value, n, default):
+        """Validate an H timing-aug probability vector; None -> the nominal default."""
+        if value is None:
+            return list(default)
+        p = [float(x) for x in list(value)]
+        if len(p) != n or min(p) < 0.0 or abs(sum(p) - 1.0) > 1e-6:
+            raise ValueError(f"H timing probs must be {n} non-negative values summing to 1; got {p}")
+        return p
+
+    def _probe_grasp_offset_convention(self, n_probe: int = 16) -> bool:
+        """Pin the `grasp_offset` composition convention against the STORED ground truth.
+
+        The actor composes `goal = rail_a (+) grasp_offset` (contract §4). `grasp_offset` is
+        documented as `T_tcp_panel`, which implies `T_world_tcpgoal = T_world_railA @
+        inv(T_tcp_panel)` — but the sign of a stored offset is exactly the kind of thing that
+        silently flips between producer and consumer (the 59.5 mm ee/tcp ambiguity in §0 is the
+        same failure class). So verify it numerically: for real frames, the map built by
+        `rail_to_ee_goal_maps` from the STORED `rail_a_cam` must reproduce the STORED
+        `goal_rot_cam` / `ee_goal_*`. Fails loud when NEITHER convention matches.
+        Returns True for the inverse (documented) convention."""
+        rb = self.replay_buffer
+        n = int(rb['rail_a_cam'].shape[0])
+        rng = np.random.default_rng([self.seed, 20260731])
+        idxs = rng.choice(n, size=min(n_probe, n), replace=False)
+        errs = {}
+        for invert in (True, False):
+            e_rot, e_pos = 0.0, 0.0
+            for i in idxs:
+                i = int(i)
+                R_cv0 = quat_wxyz_to_rotmat(rb['cam_quat_cv'][i])
+                R_tcp0 = quat_wxyz_to_rotmat(rb['tcp_quat_w'][i])
+                p_tcp0 = np.asarray(rb['tcp_pos_w'][i], np.float64)
+                p_ee0 = np.asarray(rb['ee_pos_w'][i], np.float64)
+                m = rail_to_ee_goal_maps(
+                    R_cv0.T @ R_tcp0, R_cv0.T @ (p_ee0 - p_tcp0),
+                    rb['grasp_offset'][i], float(np.asarray(rb['q7_goal'][i]).reshape(-1)[0]),
+                    invert_offset=invert)
+                rail = np.asarray(rb['rail_a_cam'][i], np.float64).reshape(6)
+                X = rotvec_to_rotmat(rail[3:])
+                # goal frame: X @ R_frame must equal exp(goal_rot_cam)
+                F_pred = X @ np.asarray(m["R_frame"], np.float64)
+                F_gt = rotvec_to_rotmat(np.asarray(rb['goal_rot_cam'][i], np.float64).reshape(3))
+                e_rot = max(e_rot, float(np.abs(rotmat_to_rotvec(F_pred @ F_gt.T)).max()))
+                # ee goal position in C0 relative to p_ee0
+                p_pred = rail[:3] + X @ np.asarray(m["tvec"], np.float64) \
+                    - np.asarray(m["eeoff"], np.float64)
+                p_gt = R_cv0.T @ (np.asarray(rb['ee_goal_pos_w'][i], np.float64) - p_ee0)
+                e_pos = max(e_pos, float(np.abs(p_pred - p_gt).max()))
+            errs[invert] = (e_rot, e_pos)
+        best = min(errs, key=lambda k: errs[k][0] + errs[k][1])
+        e_rot, e_pos = errs[best]
+        if e_rot > 1e-3 or e_pos > 1e-3:                    # 1 mrad / 1 mm
+            raise ValueError(
+                "grasp_offset composition does not reproduce the stored goal. "
+                f"invert=True err(rot_rad,pos_m)={errs[True]}, invert=False={errs[False]}. "
+                "Either the producer's `grasp_offset`/`rail_a_cam`/`ee_goal_*` conventions "
+                "changed or `rail_to_ee_goal_maps` is wrong — do NOT train through this.")
+        if not best:
+            cprint("[H] WARNING: grasp_offset matches the NON-inverse convention "
+                   "(T_world_railA @ T_tcp_panel). Using it; tell the converter owner.", "yellow")
+        cprint(f"[H] grasp_offset convention verified: invert={best} "
+               f"(rot {e_rot:.2e} rad, pos {e_pos:.2e} m)", "green")
+        return bool(best)
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
-            replay_buffer=self.replay_buffer, sequence_length=self.horizon,
+            replay_buffer=self.replay_buffer, sequence_length=self.seq_len,
             pad_before=self.pad_before, pad_after=self.pad_after,
             episode_mask=~self.train_mask)
         val_set.train_mask = ~self.train_mask
@@ -278,7 +690,144 @@ class LumiPlaceImageDataset(BaseDataset):
                 s['tcp_pos_w'], s['tcp_quat_w'], s['cam_quat_cv'], anchor))
         return np.concatenate(chunks, axis=0)
 
+    # ------------------------------------------------------------------ H row construction
+    def _h_window_geometry(self, s, anchor):
+        """Extract the H pose geometry from a sampled window `s` at `anchor`.
+
+        Everything the row builder + the policy-side goal composition needs, in ONE place so
+        the normalizer pass and __getitem__ cannot drift apart. Returns a dict of float64.
+        """
+        H = self.pose_horizon
+        sl = slice(anchor, anchor + H)
+        p_ee = np.asarray(s['ee_pos_w'][sl], np.float64)
+        R_ee = quat_wxyz_to_rotmat(np.asarray(s['ee_quat_w'][sl], np.float64))
+        q7 = np.asarray(s['q7'][sl], np.float64).reshape(-1)
+        assert len(p_ee) == H, f"window too short: {len(p_ee)} < pose_horizon {H}"
+        R_cv0 = quat_wxyz_to_rotmat(np.asarray(s['cam_quat_cv'][anchor], np.float64))
+        # goal keys are episode-constant and tiled -> the anchor row is the whole episode
+        p_goal = np.asarray(s['ee_goal_pos_w'][anchor], np.float64)
+        R_goal = quat_wxyz_to_rotmat(np.asarray(s['ee_goal_quat_w'][anchor], np.float64))
+        q7_goal = float(np.asarray(s['q7_goal'][anchor]).reshape(-1)[0])
+        goal_rot_cam = np.asarray(s['goal_rot_cam'][anchor], np.float64).reshape(3)
+        return dict(p_ee=p_ee, R_ee=R_ee, q7=q7, R_cv0=R_cv0,
+                    p_goal=p_goal, R_goal=R_goal, q7_goal=q7_goal, goal_rot_cam=goal_rot_cam)
+
+    def _h_goal_perturbation(self, sample_rng):
+        """Scheduled-sampling noise on the goal ESTIMATE (contract §3.3). Returns (dR, dp) in
+        WORLD coordinates. dR left-multiplies both the goal rotation and the goal FRAME, which
+        is exactly equivalent to perturbing `goal_rot_cam` (R_g' = dR @ R_g); dp shifts the goal
+        position, which only the `delta`+`goal` rows depend on. Zero knobs => identity."""
+        s_mm = float(self.aug.get("goal_frame_noise_mm", 0.0) or 0.0)
+        s_deg = float(self.aug.get("goal_frame_noise_deg", 0.0) or 0.0)
+        dR = np.eye(3)
+        dp = np.zeros(3)
+        if s_deg > 0.0:
+            dR = rotvec_to_rotmat(sample_rng.normal(scale=np.radians(s_deg), size=3))
+        if s_mm > 0.0:
+            dp = sample_rng.normal(scale=s_mm / 1000.0, size=3)
+        return dR, dp
+
+    def _h_build_rows(self, g, dR=None, dp=None):
+        """Build the (rows,7) action tensor + the goal-frame bookkeeping the policy needs.
+
+        `g` comes from `_h_window_geometry`; (dR, dp) is the optional goal perturbation.
+        Returns (action, extras) where extras carries the C0-frame tensors used by the
+        goal-frame scheduled sampling and the goal-coincidence losses."""
+        dR = np.eye(3) if dR is None else dR
+        dp = np.zeros(3) if dp is None else dp
+        R_cv0 = g['R_cv0']
+        p_goal = g['p_goal'] + dp
+        R_goal = dR @ g['R_goal']
+        # F = the goal frame expressed in the anchor camera frame ("C0"); R_g = R_cv0 @ F.
+        # Perturbing the goal rotation by dR (world) maps to R_g' = dR @ R_g exactly, i.e.
+        # F' = R_cv0.T @ dR @ R_cv0 @ F. The policy only ever needs F (R_cv0 cancels in the
+        # frame-change rotation M = F_hat.T @ F), so C0 is the natural currency.
+        F = R_cv0.T @ dR @ goal_frame_rotation(R_cv0, g['goal_rot_cam'])
+        R_frame = R_cv0 if self.action_frame == "cam0" else (R_cv0 @ F)
+        action = build_h_action_rows(
+            g['p_ee'], g['R_ee'], g['q7'], p_goal, R_goal, g['q7_goal'],
+            R_frame, self.action_param, self.action_frame, self.h_dt)
+        # goal-coincidence target: the remaining transform at the anchor, in the output frame.
+        remaining = remaining_to_goal(g['p_ee'][0], g['R_ee'][0], p_goal, R_goal, R_frame)
+        # ... valid ONLY where the horizon actually reaches the goal (see H_GOAL_INTEGRAL_TOL_M)
+        inreach = float(np.linalg.norm(g['p_ee'][-1] - p_goal) <= H_GOAL_INTEGRAL_TOL_M)
+        extras = dict(
+            h_goal_frame=F.astype(np.float32),                       # (3,3) F (with noise)
+            h_goal_remaining=remaining.astype(np.float32),            # (6,)
+            h_goal_inreach=np.array([inreach], dtype=np.float32),     # (1,)
+            h_ee0_rot=(R_cv0.T @ g['R_ee'][0]).astype(np.float32),   # (3,3) R_ee[0] in C0
+        )
+        return action.astype(np.float32), extras
+
+    def _h_all_action_rows(self):
+        """Action rows for EVERY train window — the normalizer must be fit over the exact
+        tensors training sees (mirrors `_all_anchored_actions`). Pose-only sampler so the
+        image arrays are never sliced. Fit on the CLEAN rows: the scheduled-sampling noise is
+        15 mm / 1.5 deg, far inside the limits, and letting it move the normalizer would make
+        the fit depend on the RNG."""
+        keys = ['ee_pos_w', 'ee_quat_w', 'q7', 'cam_quat_cv',
+                'ee_goal_pos_w', 'ee_goal_quat_w', 'q7_goal', 'goal_rot_cam']
+        pose_sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer, sequence_length=self.seq_len,
+            pad_before=self.pad_before, pad_after=self.pad_after,
+            keys=keys, episode_mask=self.train_mask)
+        rows = []
+        for idx in range(len(pose_sampler)):
+            s = pose_sampler.sample_sequence(idx)
+            g = self._h_window_geometry(s, self.pad_before)
+            rows.append(self._h_build_rows(g)[0])
+        out = np.concatenate(rows, axis=0)
+        cprint(f"[H] action normalizer fit over {len(rows)} windows x {self.action_rows} rows "
+               f"-> {out.shape}", "green")
+        return out
+
+    def _h_all_tcpcam(self):
+        """`tcpcam` over the whole buffer (for the normalizer): ee_link pose in the camera
+        frame at the SAME frame + q7. Cheap enough to vectorize over all frames."""
+        rb = self.replay_buffer
+        R_cv = quat_wxyz_to_rotmat(np.asarray(rb['cam_quat_cv'][:], np.float64))       # (T,3,3)
+        R_ee = quat_wxyz_to_rotmat(np.asarray(rb['ee_quat_w'][:], np.float64))
+        dp = np.asarray(rb['ee_pos_w'][:], np.float64) - np.asarray(rb['cam_pos_w'][:], np.float64)
+        pos = np.einsum('tji,tj->ti', R_cv, dp)                     # R_cv.T @ dp per frame
+        rel = np.einsum('tji,tjk->tik', R_cv, R_ee)                 # R_cv.T @ R_ee
+        rv = np.stack([rotmat_to_rotvec(m) for m in rel])
+        q7 = np.asarray(rb['q7'][:], np.float64).reshape(-1, 1)
+        return np.concatenate([pos, rv, q7], axis=1).astype(np.float32)   # (T,7)
+
+    def get_h_normalizer(self, mode='limits', **kwargs):
+        """H normalizer (contract §4 obs dict + §3 action). Every field the model consumes is
+        fit here; a missing field would silently pass through UNNORMALIZED (LinearNormalizer
+        returns the input for unknown keys) — so assert the set afterwards."""
+        rb = self.replay_buffer
+        # `dt` is the TRUE image gap in seconds. Fit over the full contract support {0, .1, .2}
+        # rather than the observed values, so that turning the timing aug on/off cannot change
+        # the normalization (and a nominal-only val split is not a degenerate fit).
+        dt_support = (np.arange(self.h_max_gap + 1, dtype=np.float32)
+                      / self.control_hz).reshape(-1, 1)
+        data = {
+            'action': self._h_all_action_rows(),
+            'rail_a': np.asarray(rb['rail_a_cam'][:], np.float32),          # place-head target
+            'task': np.asarray(rb['task'][:], np.float32),
+            'agent_pos': np.asarray(rb['agent_pos'][:], np.float32),
+            'grasp_off': np.asarray(rb['grasp_offset'][:], np.float32),
+            'ego': np.asarray(rb['tcp_egomotion'][:], np.float32),
+            'twist': np.asarray(rb['tcp_twist'][:], np.float32),
+            'tcpcam': self._h_all_tcpcam(),
+            'dt': dt_support,
+            'twist_hist': np.asarray(rb['twist_hist'][:], np.float32).reshape(-1, 6),
+        }
+        normalizer = LinearNormalizer()
+        normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+        normalizer['head_cam'] = SingleFieldLinearNormalizer.create_identity()
+        normalizer['depth_cam'] = SingleFieldLinearNormalizer.create_identity()
+        missing = [k for k in H_OBS_KEYS + ('action', 'rail_a')
+                   if k not in normalizer.params_dict]
+        assert not missing, f"H normalizer missing fields {missing} (would pass through raw)"
+        return normalizer
+
     def get_normalizer(self, mode='limits', **kwargs):
+        if self.h_mode:
+            return self.get_h_normalizer(mode=mode, **kwargs)
         normalizer = LinearNormalizer()
         normalizer.fit(
             data={
@@ -467,6 +1016,148 @@ class LumiPlaceImageDataset(BaseDataset):
                 f"{self.depth_channels} (depth_input={self.depth_input}). Align shape_meta "
                 f"depth_cam / robotwin_task.depth_channels / depth_input.")
 
+    # ------------------------------------------------------------------ H sample assembly
+
+    def _h_frame_indices(self, anchor, sample_rng):
+        """Timing augmentation (contract §5) -> (image indices, proprio indices, dt seconds).
+
+        `obs_gap_frames ~ obs_gap_probs` over {0,1,2}: spacing of the obs IMAGES. 0 reproduces
+        the observed duplicate-camera-frame failure, 1 = nominal 100 ms, 2 = 200 ms.
+        `image_lag_frames ~ image_lag_probs` over {0,1}: both images are taken that many frames
+        BEFORE the action anchor while PROPRIO stays at the anchor — the measured 100-150 ms
+        observation staleness (joint states arrive fast, images do not).
+        `dt` reports the TRUE image gap so the jitter is in-distribution, never a silent lie.
+        Sub-100 ms jitter is NOT representable (images exist only at 10 Hz) — data-request item,
+        do not fake it. Eval/export (augment off) => gap 1, lag 0 = nominal.
+        """
+        To = self.n_obs_steps
+        if self.augment:
+            gap = int(sample_rng.choice(self.h_max_gap + 1, p=self.obs_gap_probs))
+            lag = int(sample_rng.choice(self.h_max_lag + 1, p=self.image_lag_probs))
+        else:
+            gap, lag = 1, 0
+        cur = anchor - lag
+        img_idx = [cur - gap * (To - 1 - i) for i in range(To)]
+        # Proprio is NOT lagged and keeps its native 1-frame spacing: `ego`/`twist`/`twist_hist`
+        # are stored per control frame with those exact semantics (contract §1.2), so re-spacing
+        # them would silently redefine the quantity.
+        pro_idx = [anchor - (To - 1 - i) for i in range(To)]
+        assert min(img_idx + pro_idx) >= 0, (
+            f"H window underflow: img={img_idx} pro={pro_idx} anchor={anchor} "
+            f"(pad_before={self.pad_before})")
+        return img_idx, pro_idx, float(gap) / self.control_hz
+
+    def _h_sample_to_data(self, sample, ep_idx=None, sample_idx=0):
+        """Build one H training sample: contract §4 obs dict + §3 action rows (+ supervision)."""
+        anchor = self.pad_before
+        ep_rng = (np.random.default_rng([self.seed, 1000003, ep_idx])
+                  if ep_idx is not None else np.random.default_rng([self.seed, 1000003]))
+        sample_rng = np.random.default_rng([self.seed, 7777777, ep_idx or 0, sample_idx])
+
+        img_idx, pro_idx, dt_true = self._h_frame_indices(anchor, sample_rng)
+        ii = np.asarray(img_idx)
+        pi = np.asarray(pro_idx)
+
+        # ---------------- images (RGB + xyz point-map), taken at the IMAGE indices ----------
+        head_cam = sample['head_camera'][ii].astype(np.float32) / 255.0
+        depth_mm = sample['depth'][ii].astype(np.float32)
+
+        # ---------------- typed proprio, taken at the PROPRIO indices ----------------------
+        agent_pos = sample['agent_pos'][pi].astype(np.float32)          # (To,7) joints [rad]
+        task = sample['task'][pi].astype(np.float32)                    # (To,1)
+        grasp_off = sample['grasp_offset'][pi].astype(np.float32)       # (To,7) [xyz,quat wxyz]
+        ego = sample['tcp_egomotion'][pi].astype(np.float32)            # (To,6)
+        twist = sample['tcp_twist'][pi].astype(np.float32)              # (To,6)
+        twist_hist = sample['twist_hist'][pi].astype(np.float32)        # (To,5,6)
+        dt = np.full((self.n_obs_steps, 1), dt_true, dtype=np.float32)  # (To,1) TRUE image gap
+        # `tcpcam` = ee_link CONFIGURATION in the camera frame at the same frame + q7. Not
+        # motion: it is where the tool tip sits in camera coordinates, so the servo error
+        # (goal_cam (-) tcp_cam) is expressible; it varies with q7 because the camera rides on
+        # link_6_extension. anchored_delta(cam_pose, ee_pose, R_cv) reduces exactly to
+        # [R_cv.T (p_ee - p_cam) ; rotvec(R_cv.T R_ee)] since the anchor rotation IS R_cv.
+        tcpcam = np.empty((self.n_obs_steps, 7), dtype=np.float32)
+        for j, k in enumerate(pi):
+            R_cv = quat_wxyz_to_rotmat(np.asarray(sample['cam_quat_cv'][k], np.float64))
+            R_ee = quat_wxyz_to_rotmat(np.asarray(sample['ee_quat_w'][k], np.float64))
+            tcpcam[j, :6] = anchored_delta(sample['cam_pos_w'][k], R_cv,
+                                           sample['ee_pos_w'][k], R_ee, R_cv)
+            tcpcam[j, 6] = float(np.asarray(sample['q7'][k]).reshape(-1)[0])
+
+        # ---------------- action rows + goal bookkeeping ------------------------------------
+        g = self._h_window_geometry(sample, anchor)
+        dR, dp = ((None, None) if not self.augment
+                  else self._h_goal_perturbation(sample_rng))
+        action, extras = self._h_build_rows(g, dR, dp)
+
+        # Constant maps that let the POLICY compose goal = rail_a (+) grasp_offset in C0
+        # (see rail_to_ee_goal_maps). Training-only: never an obs input, never in the ONNX graph.
+        gc = rail_to_ee_goal_maps(
+            g['R_cv0'].T @ quat_wxyz_to_rotmat(np.asarray(sample['tcp_quat_w'][anchor], np.float64)),
+            g['R_cv0'].T @ (g['p_ee'][0] - np.asarray(sample['tcp_pos_w'][anchor], np.float64)),
+            sample['grasp_offset'][anchor], g['q7_goal'],
+            invert_offset=getattr(self, 'grasp_offset_invert', True))
+
+        # ---------------- augmentation ------------------------------------------------------
+        if self.augment and ep_idx is not None:
+            depth_mm = self._augment_depth_mm(depth_mm, ep_rng, sample_rng)
+            # Per-key proprio DR (contract §4.3). Noise only — the per-key BLOCK MASK lives in
+            # the policy because it substitutes a LEARNED mask token (zero is an in-distribution
+            # value the net can detect and ignore; v7 lesson).
+            nj = float(self.aug.get("proprio_noise_joint_deg", 0.0) or 0.0)
+            if nj > 0.0:
+                agent_pos = agent_pos + sample_rng.normal(
+                    scale=np.radians(nj), size=agent_pos.shape).astype(np.float32)
+                tcpcam[:, 6] += sample_rng.normal(
+                    scale=np.radians(nj), size=self.n_obs_steps).astype(np.float32)
+            nt = float(self.aug.get("proprio_noise_twist_frac", 0.0) or 0.0)
+            if nt > 0.0:                                  # multiplicative: scale-free on v and w
+                twist = twist * (1.0 + sample_rng.normal(
+                    scale=nt, size=twist.shape).astype(np.float32))
+                twist_hist = twist_hist * (1.0 + sample_rng.normal(
+                    scale=nt, size=twist_hist.shape).astype(np.float32))
+            ne = float(self.aug.get("proprio_noise_ego_mm", 0.0) or 0.0)
+            if ne > 0.0:
+                ego = ego.copy()
+                ego[:, :3] += sample_rng.normal(
+                    scale=ne / 1000.0, size=ego[:, :3].shape).astype(np.float32)
+            if not self.gpu_offload and any(
+                    v > 0.0 for v in (self.photo_brightness, self.photo_contrast,
+                                      self.photo_saturation, self.photo_hue, self.photo_blur_p,
+                                      self.photo_noise, self.photo_erase_p)):
+                head_cam = self._augment_photometric(head_cam, sample_rng)
+            # SO(2) roll is NOT applied in H: co-rotating the xyz point-map (per-pixel 3-D) and
+            # every camera-frame label/goal-frame tensor here is not implemented, and a partial
+            # co-rotation would silently de-register the labels. Keep rot_aug_deg=0 for H.
+            assert self.rot_aug_deg == 0.0, (
+                "rot_aug_deg>0 is unsupported in H mode (xyz point-map + goal-frame tensors "
+                "would need co-rotation); set augmentation.rot_aug_deg=0")
+
+        depth_cam = self._encode_depth(depth_mm)
+        self._check_depth_channels(depth_cam)
+
+        obs = {
+            'head_cam': head_cam, 'depth_cam': depth_cam,
+            'agent_pos': agent_pos, 'task': task, 'grasp_off': grasp_off,
+            'ego': ego, 'twist': twist, 'tcpcam': tcpcam, 'dt': dt,
+            'twist_hist': twist_hist,
+        }
+        assert set(obs) == set(H_OBS_KEYS), f"H obs keys drifted: {sorted(obs)}"
+        out = {
+            'obs': obs,
+            'action': action,                                                    # (rows,7)
+            # place head target (contract §3.2): rail_a_cam is GRASP-OFFSET-FREE, so the
+            # perception head learns a pure visual landmark and the actor composes the goal.
+            'rail_a': sample['rail_a_cam'][anchor].astype(np.float32),           # (6,)
+            'arm_kpts_uv': sample['arm_kpts_uv'][pi].astype(np.float32),         # (To,N,3)
+            'arm_kpts_cam': sample['arm_kpts_cam'][pi].astype(np.float32),       # (To,N,3)
+            'phase_id': sample['phase_id'][anchor].astype(np.int64).reshape(1),  # (1,)
+            'done': sample['done'][anchor].astype(np.float32).reshape(1),        # (1,)
+            'h_gc_tvec': gc['tvec'], 'h_gc_eeoff': gc['eeoff'],
+            'h_gc_Ree': gc['R_ee'], 'h_gc_Rframe': gc['R_frame'],
+        }
+        out.update(extras)
+        return out
+
     def _sample_to_data(self, sample, ep_idx=None, sample_idx=0):
         task = sample['task'][:, ].astype(np.float32)
         prev_action = sample['prev_action'][:, ].astype(np.float32)
@@ -567,5 +1258,6 @@ class LumiPlaceImageDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
-        data = self._sample_to_data(sample, ep_idx=self._episode_of(idx), sample_idx=idx)
+        fn = self._h_sample_to_data if self.h_mode else self._sample_to_data
+        data = fn(sample, ep_idx=self._episode_of(idx), sample_idx=idx)
         return dict_apply(data, torch.from_numpy)
