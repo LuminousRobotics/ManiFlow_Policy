@@ -239,6 +239,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         self._paired_crop = False
         self._crop_size = None
         self._crop_out = None
+        self._last_crop = (0, 0)     # H: crop offsets of the LAST forward (see forward())
         photometric = []
         if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
             assert transforms[0].type == 'RandomCrop'
@@ -334,10 +335,23 @@ class TimmObsEncoder(ModuleAttrMixin):
         if self.token_imagenet_norm:
             self.register_buffer('_in_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
             self.register_buffer('_in_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        # H (contract §4): a low-dim key with a 2-D shape (e.g. twist_hist (5,6)) is a SEQUENCE
+        # of physical quantities, not one vector — project its LAST dim and emit shape[0] tokens
+        # so the 50 Hz micro-history becomes 5 separable tokens instead of one 30-D smear.
+        # Those tokens come from the MOST RECENT obs frame only: the micro-history already spans
+        # the inter-frame interval, so the previous frame's copy is redundant, and the contract's
+        # 147-token budget counts twist_hist ONCE (5 tokens, not 5 x n_obs_steps).
+        self.lowdim_seq_keys = {k for k in low_dim_keys if len(key_shape_map[k]) == 2}
         if token_output and self.lowdim_as_tokens:
             self.lowdim_proj = nn.ModuleDict({
-                key: nn.Linear(int(np.prod(key_shape_map[key])), feature_dim)
+                key: nn.Linear(int(key_shape_map[key][-1] if key in self.lowdim_seq_keys
+                                   else np.prod(key_shape_map[key])), feature_dim)
                 for key in low_dim_keys})
+        # Token layout the POLICY needs to attach per-key type-ID embeddings / block masks:
+        # [(key, n_tokens_emitted), ...] in emission order (== sorted low_dim_keys).
+        self.lowdim_token_spec = [
+            (k, int(key_shape_map[k][0]) if k in self.lowdim_seq_keys else None)
+            for k in low_dim_keys]
 
         if model_name.startswith('vit'):
             # assert self.feature_aggregation is None # vit uses the CLS token
@@ -429,6 +443,10 @@ class TimmObsEncoder(ModuleAttrMixin):
                 crop_j = int(torch.randint(0, max_off + 1, (1,)).item())
             else:
                 crop_i = crop_j = max_off // 2
+        # H (contract §4.1): the 3D-aware RGB positional add must pool the xyz point-map over
+        # the SAME pixels the RGB tokens saw, so the policy replays this forward's crop. Random
+        # in training, deterministic (center) at eval/export — so the traced graph is constant.
+        self._last_crop = (crop_i, crop_j)
 
         # process rgb input
         for key in self.rgb_keys:
@@ -504,8 +522,12 @@ class TimmObsEncoder(ModuleAttrMixin):
                 assert B == batch_size
                 assert data.shape[2:] == self.key_shape_map[key]
                 if self.token_output:
-                    # (B,T,*) -> one projected token per frame: (B, T, D)
-                    tok = self.lowdim_proj[key](data.reshape(B, T, -1))
+                    if key in self.lowdim_seq_keys:
+                        # (B,T,n,d) -> most-recent frame only -> n tokens: (B, n, D)
+                        tok = self.lowdim_proj[key](data[:, T - 1])
+                    else:
+                        # (B,T,*) -> one projected token per frame: (B, T, D)
+                        tok = self.lowdim_proj[key](data.reshape(B, T, -1))
                     features.append(tok)
                 else:
                     features.append(data.reshape(B, -1))
