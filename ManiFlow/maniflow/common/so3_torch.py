@@ -30,23 +30,64 @@ def rotvec_to_rotmat(rv: torch.Tensor) -> torch.Tensor:
     return eye + s.unsqueeze(-1) * K + c.unsqueeze(-1) * (K @ K)
 
 
-def rotmat_to_rotvec(R: torch.Tensor) -> torch.Tensor:
-    """(...,3,3) rotation matrix -> (...,3) rotation vector.
+# Angle band (radians below pi) where the SKEW part stops carrying a usable axis and the
+# symmetric part takes over. Matches the numpy twin's `angle > np.pi - 1e-6` exactly, so the
+# two implementations switch branches on the same inputs and `tests/test_h_geometry_parity.py`
+# compares like with like.
+_NEAR_PI_BAND = 1e-6
 
-    Uses the skew part scaled by angle/(2 sin angle). Valid for |angle| < pi - eps, which every
-    H quantity satisfies by construction (post-yaw-skip total rotation is ~9 deg, and the
-    per-sample goal-frame noise is 1.5 deg). The trace is clamped so acos never sees >1 from
-    fp round-off, and sin is clamped away from 0 so the small-angle limit degrades to the
-    first-order skew form rather than NaN."""
-    tr = ((R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]) - 1.0) * 0.5
-    angle = torch.acos(tr.clamp(-1.0 + 1e-7, 1.0 - 1e-7))
+
+def _axis_near_pi(R: torch.Tensor, skew: torch.Tensor) -> torch.Tensor:
+    """Unit rotation axis recovered from the SYMMETRIC part, for angles at/near pi.
+
+    At angle == pi, `R = 2 a aT - I`, so `(R + I)/2 = a aT`: column k of it is `a_k * a`, and
+    the best-conditioned column is the one with the largest diagonal `a_k^2`. The skew part is
+    `2 sin(angle) * a`, which VANISHES at pi — that is exactly why it cannot supply the axis
+    there, and why the plain skew formula collapsed to |out| ~ 0.7 instead of ~pi.
+    Written with gather/argmax rather than python indexing so the function stays trace-safe."""
+    eye = torch.eye(3, dtype=R.dtype, device=R.device).expand_as(R)
+    A = 0.5 * (R + eye)                                       # -> a aT
+    d = torch.diagonal(A, dim1=-2, dim2=-1)                   # (...,3) = a_k^2
+    k = d.argmax(dim=-1, keepdim=True)                        # (...,1) best-conditioned column
+    col = torch.gather(A, -1, k.unsqueeze(-2).expand(*A.shape[:-1], 1)).squeeze(-1)
+    axis = col / col.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    # +a*pi and -a*pi are the SAME rotation at exactly pi, but just below pi the skew still
+    # carries the sign — follow it so the function is continuous across the branch switch.
+    s = torch.sign((axis * skew).sum(-1, keepdim=True))
+    return axis * torch.where(s == 0, torch.ones_like(s), s)
+
+
+def rotmat_to_rotvec(R: torch.Tensor) -> torch.Tensor:
+    """(...,3,3) rotation matrix -> (...,3) rotation vector. Valid over the FULL [0, pi] domain.
+
+    The angle comes from `atan2(|skew|/2, (tr-1)/2)` == `atan2(sin a, cos a)`, NOT from
+    `acos(cos a)`. This matters: `acos` is ill-conditioned wherever |cos a| -> 1, i.e. at BOTH
+    ends of the domain, and the previous `clamp(tr, -1+1e-7, ...)` capped the angle at
+    `pi - 4.5e-4` — a matrix 1e-4 from pi came back with |out| = 0.70 and a geodesic error of
+    ~pi. `atan2` has no such cap and is exact at 0 and pi.
+
+    The AXIS still comes from the skew part (`2 sin a * a`) everywhere except the last
+    `_NEAR_PI_BAND` radians, where sin a -> 0 destroys it and the symmetric part takes over
+    (`_axis_near_pi`). In-domain numerics are unchanged in kind: for H's actual quantities
+    (post-yaw-skip rotation <= ~9 deg, goal-frame noise 1.5 deg) `atan2` and `acos` agree to
+    fp round-off, and the parity test pins that against the numpy twin.
+
+    Reachable near-pi inputs are rare but real: the goal-consistency target composes
+    `F_hatT (R_G R_0T) F_hat` from the PLACE HEAD's output, which early in training is garbage
+    and can be a half turn from the anchor. A silent collapse there feeds a wrong gradient into
+    the very head the loss exists to supervise."""
     skew = torch.stack([R[..., 2, 1] - R[..., 1, 2],
                         R[..., 0, 2] - R[..., 2, 0],
-                        R[..., 1, 0] - R[..., 0, 1]], dim=-1)
-    scale = angle / (2.0 * torch.sin(angle).clamp(min=1e-7))
+                        R[..., 1, 0] - R[..., 0, 1]], dim=-1)  # = 2 sin(angle) * axis
+    sin_a = 0.5 * skew.norm(dim=-1)                            # |sin(angle)|, >= 0
+    cos_a = ((R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]) - 1.0) * 0.5
+    angle = torch.atan2(sin_a, cos_a)                          # in [0, pi], stable at both ends
+    scale = angle / (2.0 * sin_a.clamp(min=1e-7))
     # angle -> 0: scale -> 1/2, which is exactly the first-order skew form.
     scale = torch.where(angle < 1e-5, torch.full_like(scale, 0.5), scale)
-    return skew * scale.unsqueeze(-1)
+    out = skew * scale.unsqueeze(-1)
+    near_pi = (angle > (torch.pi - _NEAR_PI_BAND)).unsqueeze(-1)
+    return torch.where(near_pi, _axis_near_pi(R, skew) * angle.unsqueeze(-1), out)
 
 
 def compose_rotvecs(rotvecs: torch.Tensor) -> torch.Tensor:
