@@ -62,6 +62,22 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             n_keypoints=7,                     # converter N_KEYPOINTS (rail samples + tube)
             kpt_head_hires=False,              # G1: 56x56 deconv heatmap head + log-z -> N 3-D point tokens
             pointnet_dim=0,                    # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
+            # --- H-series (v10): ee_link action space + goal-frame anchoring (contract §3/§4/§6).
+            # action_param=None keeps every prior arm bit-identical; the whole H chassis is OFF.
+            action_param=None,                 # None (legacy) | "twist" | "delta"
+            action_frame="cam0",               # "cam0" | "goal"
+            control_hz=10.0,                   # Delta t = 1/control_hz for the twist integral
+            rot_integral_approx=False,         # ablation: small-angle SUM instead of composition
+            goal_integral_weight=0.0,          # goal-coincidence integral constraint (goal frames)
+            terminal_zero_weight=0.0,          # terminal settle ||row_last|| (goal frames)
+            goal_consistency_weight=0.0,       # ||u_0 - ad(P_0, G_hat, R_g)|| (delta+goal)
+            action_rate_weight=0.05,           # sum_k ||row_k - row_{k-1}||^2 (always)
+            goal_frame_self_p_max=0.0,         # scheduled sampling: max prob of the SELF frame
+            goal_frame_anneal_epochs=40,       # ... ramped 0 -> max over this many epochs
+            phase_loss_weight=0.0,             # phase head CE (0=place_xy, 1=place_z)
+            done_loss_weight=0.0,              # done head BCE
+            rgb3d_pos_enc=False,               # 3D-aware RGB tokens (zero-init xyz patch add)
+            pointnet_tokens=16,                # K PointNet tokens (4x4 masked-max-pool grid)
             **kwargs):
         super().__init__()
 
@@ -74,9 +90,40 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             action_dim = action_shape[0] * action_shape[1]
         else:
             raise NotImplementedError(f"Unsupported action shape {action_shape}")
-            
+
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
+
+        # ------------------------------------------------------------------ H-series switch
+        # `horizon` in H means POSES (H=16). The number of PREDICTED ROWS depends on the mode
+        # (contract §3): 15 for twist/* and delta+cam0 (whose k=0 row is identically zero and is
+        # PREPENDED as a constant at export), 16 for delta+goal (whose row 0 is the remaining
+        # transform, not zero). Everything downstream that is shaped by the action tensor —
+        # DiTX pos_emb, cond_data, the normalizer, eval's noise input — must use the ROW count,
+        # so self.horizon becomes the row count and self.pose_horizon keeps H.
+        self.action_param = action_param
+        self.action_frame = str(action_frame)
+        self.h_mode = action_param is not None
+        self.pose_horizon = int(horizon)
+        self.control_hz = float(control_hz)
+        if self.h_mode:
+            from maniflow.dataset.lumi_place_image_dataset import (
+                H_ACTION_DIM, H_ACTION_FRAMES, H_ACTION_PARAMS, h_action_rows)
+            assert action_param in H_ACTION_PARAMS, f"action_param={action_param!r}"
+            assert self.action_frame in H_ACTION_FRAMES, f"action_frame={action_frame!r}"
+            assert action_dim == H_ACTION_DIM, (
+                f"H needs action_dim {H_ACTION_DIM} ([6-DoF ee_link | dJ7]); shape_meta says "
+                f"{action_dim}")
+            self.action_rows = h_action_rows(action_param, self.action_frame, self.pose_horizon)
+            # row 0 exists in the EXPORTED tensor but is not predicted (delta+cam0 only)
+            self.row0_zero = (action_param == "delta" and self.action_frame == "cam0")
+            horizon = self.action_rows
+            cprint(f"[H] {action_param}/{self.action_frame}: {self.action_rows} predicted rows "
+                   f"x {action_dim} dims (poses={self.pose_horizon}, "
+                   f"row0_zero={self.row0_zero})", "green")
+        else:
+            self.action_rows = int(horizon)
+            self.row0_zero = False
 
         # --- Lumi C2: low-dim (prev_action/task) -> AdaLN-Zero conditioning ---
         # When enabled the encoder should be configured with lowdim_as_tokens=false so the
@@ -274,12 +321,239 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # --- F1-depth: PointNet on the xyz point-map -> a 3-D conditioning token (DP3-native;
         # NOT depth-as-2D-channels through the encoder, which our C2 run proved the model ignores) ---
         self.pointnet_dim = int(pointnet_dim)
+        # H (contract §4.2): K tokens instead of ONE global vector. pointnet_tokens must be a
+        # perfect square (it is a grid x grid spatial partition of the sub-sampled point map);
+        # 1 reproduces the F1-depth single-token behaviour exactly.
+        self.pointnet_tokens = int(pointnet_tokens)
+        self.pointnet_grid = int(round(self.pointnet_tokens ** 0.5))
         if self.pointnet_dim > 0:
             from maniflow.model.vision_2d.pointnet import PointNetEncoder
+            assert self.pointnet_grid ** 2 == self.pointnet_tokens, (
+                f"pointnet_tokens must be a perfect square (4x4 grid => 16); got "
+                f"{self.pointnet_tokens}")
             self.pointnet = PointNetEncoder(out_dim=obs_feature_dim)
-            cprint(f"[F1-depth] PointNet on xyz point-map -> {obs_feature_dim}-d 3D token", "green")
+            cprint(f"[F1-depth] PointNet on xyz point-map -> {self.pointnet_tokens} "
+                   f"({self.pointnet_grid}x{self.pointnet_grid} grid) x {obs_feature_dim}-d "
+                   f"3D tokens", "green")
         else:
             self.pointnet = None
+
+        # ==================================================================================
+        # H-series chassis. Everything here is inert unless action_param is set (or the
+        # individual flag is on), so every prior arm reproduces bit-for-bit.
+        # ==================================================================================
+        self.rot_integral_approx = bool(rot_integral_approx)
+        self.goal_integral_weight = float(goal_integral_weight)
+        self.terminal_zero_weight = float(terminal_zero_weight)
+        self.goal_consistency_weight = float(goal_consistency_weight)
+        self.action_rate_weight = float(action_rate_weight) if self.h_mode else 0.0
+        self.goal_frame_self_p_max = float(goal_frame_self_p_max)
+        self.goal_frame_anneal_epochs = max(1, int(goal_frame_anneal_epochs))
+        self.phase_loss_weight = float(phase_loss_weight)
+        self.done_loss_weight = float(done_loss_weight)
+        self.rgb3d_pos_enc = bool(rgb3d_pos_enc)
+        # epoch counter driving the scheduled-sampling ramp; a buffer so it survives
+        # checkpoint/resume (a resumed run must not restart the anneal at 0).
+        self.register_buffer('h_epoch', torch.zeros((), dtype=torch.long))
+
+        # --- 3D-aware RGB tokens (contract §4.1) -----------------------------------------
+        # For each 32x32 patch of the xyz point-map: valid-masked mean (X,Y,Z) + valid_frac ->
+        # Linear(4 -> D) -> ADDED to the corresponding RGB token. Zero new tokens, and the
+        # projection is ZERO-INIT so the model starts EXACTLY at the RGB baseline and can only
+        # improve on it (the same identity-at-init discipline as AdaLN-Zero). This gives every
+        # RGB patch token its own metric 3-D position instead of a learned 2-D index.
+        if self.rgb3d_pos_enc:
+            self.rgb3d_proj = nn.Linear(4, obs_feature_dim)
+            nn.init.zeros_(self.rgb3d_proj.weight)
+            nn.init.zeros_(self.rgb3d_proj.bias)
+            cprint(f"[H] 3D-aware RGB tokens: xyz patch-pool -> Linear(4->{obs_feature_dim}) "
+                   f"(zero-init, additive)", "green")
+        else:
+            self.rgb3d_proj = None
+
+        # --- typed low-dim tokens + per-key block masking (contract §4/§4.3) --------------
+        # The encoder emits one (or n) projected token(s) per low-dim key; here each key's
+        # block gets a learned TYPE-ID embedding (the kpt_id_emb pattern) so cross-attention
+        # can tell "this is twist" from "this is egomotion" instead of having to disentangle
+        # them from a shared projection. Influence in cross-attn is not proportional to token
+        # COUNT — typing buys SEPARABILITY, which is what the copycat DR needs to bite.
+        # Masking substitutes a LEARNED mask token (zero is an in-distribution value the net
+        # can detect and route around — the v7 lesson), zero-init so it starts as the old
+        # zero-masking and then drifts.
+        self.lowdim_typed_tokens = bool(self.h_mode and getattr(obs_encoder, 'token_output', False)
+                                        and getattr(obs_encoder, 'lowdim_as_tokens', False))
+        self.h_proprio_mask_keys = ('agent_pos', 'ego', 'twist', 'tcpcam', 'twist_hist')
+        if self.lowdim_typed_tokens:
+            spec = list(obs_encoder.lowdim_token_spec)
+            self.lowdim_spec_keys = [k for k, _ in spec]
+            self.lowdim_type_emb = nn.Parameter(
+                torch.randn(len(spec), obs_feature_dim) * 0.02)
+            self.lowdim_mask_token = nn.Parameter(torch.zeros(len(spec), obs_feature_dim))
+            cprint(f"[H] typed low-dim tokens: {self.lowdim_spec_keys} "
+                   f"(mask_p={self.proprio_mask_p} on {self.h_proprio_mask_keys})", "green")
+        else:
+            self.lowdim_spec_keys = []
+            self.lowdim_type_emb = None
+            self.lowdim_mask_token = None
+
+        # --- observability heads (contract §3.2 / §6.2) -----------------------------------
+        # Tiny MLPs off the mean-pooled conditioning context. Both are FREE supervision
+        # (phase_id / done ship in the zarr) that forces the context to encode "where in the
+        # place am I" and "am I done", and both are exported so the deploy node can gate.
+        if self.h_mode:
+            self.phase_head = nn.Sequential(
+                nn.LayerNorm(obs_feature_dim),
+                nn.Linear(obs_feature_dim, 128), nn.GELU(), nn.Linear(128, 2))
+            self.done_head = nn.Sequential(
+                nn.LayerNorm(obs_feature_dim),
+                nn.Linear(obs_feature_dim, 128), nn.GELU(), nn.Linear(128, 1))
+        else:
+            self.phase_head = None
+            self.done_head = None
+
+        # --- H structural requirements: fail loud, never degrade silently -----------------
+        # The H conditioning stack is not optional plumbing — the place head IS the goal source
+        # for the goal-frame arms and for deploy, and the kpt grid defines the RGB token layout
+        # the 3D positional add indexes into. A config that leaves them off would train a model
+        # whose ONNX contract it cannot satisfy.
+        if self.h_mode:
+            assert self.kpt_head is not None and self.kpt_head_hires, (
+                "H requires the hires heatmap keypoint head (kpt_loss_weight>0 and "
+                "kpt_head_hires=true): place_pred/kpt_uv/kpt_cam are ONNX outputs and the goal "
+                "frame is derived from the place head")
+            assert self.lowdim_typed_tokens, (
+                "H requires typed low-dim CROSS-ATTN tokens: set obs_encoder.token_output=true "
+                "and obs_encoder.lowdim_as_tokens=true (and policy.lowdim_to_adaln=false)")
+            assert not self.lowdim_to_adaln, (
+                "H routes all low-dim keys as cross-attn tokens (contract §4); "
+                "lowdim_to_adaln=true would double-feed them into AdaLN")
+            # The RGB token block is assumed to be the LEADING To*g*g tokens (the kpt head, the
+            # 3D positional add and the token accounting all index it). With a second rgb-typed
+            # key the encoder emits key-major blocks and that assumption breaks — depth_cam is
+            # deliberately kept OUT of shape_meta precisely so this holds.
+            assert len(obs_encoder.rgb_keys) == 1, (
+                f"H assumes exactly ONE rgb-typed shape_meta key (head_cam); got "
+                f"{obs_encoder.rgb_keys}. depth_cam must stay out of shape_meta.")
+
+        # --- token-budget guard (updated for the H budget) --------------------------------
+        # DiTX SLICES its positional-embedding table to the actual token count, so exceeding
+        # the table would silently truncate conditioning. The v3 guard only counted the
+        # ENCODER's tokens; H appends kpt point tokens (both frames now) + K PointNet tokens,
+        # so count the real total. Contract §4 budget: 98 RGB + 14 kpt + 16 PC + 19 low-dim
+        # = 147 of 256 (visual_cond_len 128 x n_obs_steps 2).
+        if len(enc_out) == 3:
+            n_total = int(enc_out[1])
+            n_kpt = 0
+            if self.kpt_head is not None:
+                per_frame = self.n_keypoints if self.kpt_head_hires else 1
+                n_kpt = per_frame * (int(n_obs_steps) if self.h_mode else 1)
+            # legacy `_pointnet_token` emits ONE global token; only H's `_h_pointnet_tokens`
+            # emits K — do not over-count on a pre-H config sitting near the cap.
+            n_pc = 0 if self.pointnet is None else (self.pointnet_tokens if self.h_mode else 1)
+            n_total += n_kpt + n_pc
+            cap = int(visual_cond_len) * int(n_obs_steps)
+            assert n_total <= cap, (
+                f"conditioning needs {n_total} tokens (encoder {int(enc_out[1])} + kpt {n_kpt} "
+                f"+ pointnet {n_pc}) but visual_cond_len*n_obs_steps={cap}; raise "
+                f"visual_cond_len (pos-embed table @ ditx.py) to "
+                f">= {int(np.ceil(n_total / n_obs_steps))}")
+            cprint(f"[ManiFlow] token budget: {n_total} of {cap} "
+                   f"(enc {int(enc_out[1])} + kpt {n_kpt} + pc {n_pc})", "green")
+
+    # ================================================================= H helper methods
+    def set_epoch(self, epoch: int):
+        """Drives the goal-frame scheduled-sampling ramp (contract §3.3). The workspace calls
+        this once per epoch; a buffer (not a python int) so resume keeps the schedule."""
+        self.h_epoch.fill_(int(epoch))
+
+    def goal_frame_self_p(self) -> float:
+        """Probability of expressing this sample's action rows in the model's OWN predicted
+        goal frame instead of the (noisy) GT one. Ramps 0 -> goal_frame_self_p_max linearly
+        over goal_frame_anneal_epochs, then holds. Deploy is 100% self-predicted, so the ramp
+        is the train/deploy bridge; going straight to 1.0 would train against a random frame
+        while the place head is still garbage."""
+        if not (self.h_mode and self.action_frame == "goal" and self.goal_frame_self_p_max > 0):
+            return 0.0
+        frac = float(self.h_epoch.item()) / float(self.goal_frame_anneal_epochs)
+        return float(min(1.0, max(0.0, frac)) * self.goal_frame_self_p_max)
+
+    def _apply_lowdim_typing(self, vis_cond, To, train_mask=False):
+        """Add per-key type-ID embeddings to the encoder's low-dim token block, and (training
+        only) block-mask whole proprio keys with a learned mask token.
+
+        The encoder emits [ ...rgb tokens... | ...low-dim tokens... ], low-dim in sorted-key
+        order, so the low-dim block is the TRAILING slice."""
+        if not self.lowdim_typed_tokens:
+            return vis_cond
+        spec = self.obs_encoder.lowdim_token_spec
+        counts = [(n if n is not None else int(To)) for _, n in spec]
+        n_low = int(sum(counts))
+        if n_low == 0:
+            return vis_cond
+        B = vis_cond.shape[0]
+        head = vis_cond[:, :vis_cond.shape[1] - n_low]
+        low = vis_cond[:, vis_cond.shape[1] - n_low:]
+        parts, off = [], 0
+        for i, ((key, _), c) in enumerate(zip(spec, counts)):
+            blk = low[:, off:off + c] + self.lowdim_type_emb[i].view(1, 1, -1)
+            if (train_mask and self.proprio_mask_p > 0.0
+                    and key in self.h_proprio_mask_keys):
+                sel = torch.rand(B, 1, 1, device=blk.device) < self.proprio_mask_p
+                mtok = (self.lowdim_mask_token[i] + self.lowdim_type_emb[i]).view(1, 1, -1)
+                blk = torch.where(sel, mtok.to(blk.dtype).expand_as(blk), blk)
+            parts.append(blk)
+            off += c
+        return torch.cat([head] + parts, dim=1)
+
+    def _rgb3d_tokens(self, this_nobs, To):
+        """3D-aware RGB positional add (contract §4.1) -> (B, To*g*g, D) to be ADDED to the
+        RGB tokens. Replays the encoder's resize+crop so the pooled patches line up with the
+        RGB token grid exactly (the encoder records its crop offsets in `_last_crop`)."""
+        enc = self.obs_encoder
+        dp = this_nobs['depth_cam'][:, :To]                        # (B,To,4,S,S)
+        B = dp.shape[0]
+        x = dp.reshape(B * To, *dp.shape[2:])
+        rgb_key = enc.rgb_keys[0]
+        # ALL sizes come from STATIC config, never from tensor shapes: during torch.onnx.export
+        # (TS tracing) `tensor.shape[-1]` yields a traced Tensor, and feeding that to avg_pool2d
+        # as a kernel size fails at export time. int(x.shape[-1]) below is the sole shape read
+        # and is a genuine constant for the fixed-shape deployment graph.
+        out_hw = int(enc.key_shape_map[rgb_key][-1])               # 224
+        if int(x.shape[-1]) != out_hw:
+            # NEAREST, not bilinear: interpolating the validity channel (and across the
+            # invalid/glass boundary) would invent geometry. Sub-pixel accuracy is irrelevant
+            # for a 32x32 patch mean.
+            x = F.interpolate(x, size=(out_hw, out_hw), mode='nearest')
+        final_hw = out_hw
+        if getattr(enc, '_paired_crop', False):
+            ci, cj = enc._last_crop
+            cs = int(enc._crop_size)
+            x = x[..., ci:ci + cs, cj:cj + cs]
+            final_hw = int(enc._crop_out)
+            x = F.interpolate(x, size=(final_hw, final_hw), mode='nearest')
+        g = (self._kpt_grid if self.kpt_head is not None
+             else max(1, final_hw // int(getattr(enc, 'downsample_ratio', 32))))
+        ds = int(final_hw // g)                                    # 224 // 7 = 32
+        v = x[:, 3:4]                                              # (BTo,1,H,W) validity
+        num = F.avg_pool2d(x[:, :3] * v, ds)                       # mean of xyz*valid
+        den = F.avg_pool2d(v, ds)                                  # valid_frac in [0,1]
+        feat = torch.cat([num / den.clamp(min=1e-6), den], dim=1)  # (BTo,4,g,g)
+        tok = self.rgb3d_proj(feat.flatten(2).transpose(1, 2))     # (BTo,g*g,D)
+        return tok.reshape(B, To * g * g, -1)
+
+    def _h_pointnet_tokens(self, this_nobs, To):
+        """xyz point-map -> masked cloud -> K PointNet tokens (contract §4.2)."""
+        from maniflow.model.vision_2d.pointnet import cloud_from_pointmap
+        dp = this_nobs['depth_cam'][:, To - 1]                     # (B,C,S,S) most-recent frame
+        pts, valid, hw = cloud_from_pointmap(dp, stride=4, return_hw=True)
+        if self.pointnet_tokens <= 1:
+            return self.pointnet(pts, valid).unsqueeze(1)          # (B,1,D) legacy
+        return self.pointnet.forward_tokens(pts, valid, hw, grid=self.pointnet_grid)
+
+    def _h_context(self, vis_cond):
+        """Mean-pooled conditioning context -> (phase logits (B,2), done logit (B,1))."""
+        pooled = vis_cond.mean(dim=1)
+        return self.phase_head(pooled), self.done_head(pooled)
 
     def _kpt_and_goal(self, vis_cond, To, depth_z=None, cam_k=None):
         """Slice the most-recent visual frame's tokens from vis_cond (visual tokens come FIRST,
@@ -344,7 +618,78 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - goal_loss_weight: {self.goal_loss_weight} ({self.goal_loss_type})", "yellow")
 
         print_params(self)
-        
+
+    # ------------------------------------------------------------------ H keypoint tokens
+    def _kpt_depth_z_h(self, this_nobs, To):
+        """(B*To,2,S,S) [z_metres, valid] for ALL obs frames (the H kpt head runs on both)."""
+        if 'depth_cam' not in this_nobs:
+            return None
+        dp = this_nobs['depth_cam'][:, :To]                          # (B,To,4,S,S)
+        if dp.shape[2] < 4:
+            return None
+        z = dp[:, :, 2] * 2.5                                        # XYZ_SCALE_M
+        v = dp[:, :, 3]
+        return torch.stack([z, v], dim=2).reshape(-1, 2, *dp.shape[-2:])
+
+    def _kpt_and_goal_h(self, vis_cond, To, depth_z=None, cam_k=None):
+        """H: run the heatmap keypoint head on BOTH obs frames -> 2*N point tokens.
+
+        Why both frames (plan §2.2): two 3-D fixes of the same STATIC landmarks one step apart
+        are implicit camera ego-motion expressed in landmark space — the cheapest "two-frame 3D"
+        signal available, and the supervision already exists per frame (arm_kpts_* is per-frame).
+        The last-frame-only version threw half the free supervision away.
+
+        The PLACE readout is taken from the MOST RECENT frame only: it is the deploy servo
+        target, and deploy always servos on the newest observation.
+        Returns (uv (B,To,N,2), conf (B,To,N), place (B,6), tokens (B,To*N,D), extras)."""
+        assert self.kpt_head_hires, "H requires the hires heatmap head (kpt_head_hires=true)"
+        B, D = vis_cond.shape[0], vis_cond.shape[-1]
+        g = self._kpt_grid
+        Lg = g * g
+        N = self.n_keypoints
+        vis = vis_cond[:, :To * Lg, :]                                # visual tokens come FIRST
+        fmap = vis.reshape(B * To, Lg, D).transpose(1, 2).reshape(B * To, D, g, g)
+        k = cam_k if cam_k is not None else self.cam_k_norm_buf
+        if k is not None and k.dim() == 2 and k.shape[0] == B:
+            k = k.repeat_interleave(To, dim=0)                        # per-sample -> per-frame
+        out = self.kpt_head(fmap, cam_k_norm=k, depth_z=depth_z)
+        conf_s = torch.sigmoid(out["conf"]).unsqueeze(-1)             # (B*To,N,1)
+        feat = torch.cat([out["pts3d"], conf_s], dim=-1)              # (B*To,N,4)
+        tokens = self.kpt_token_proj(feat) + self.kpt_id_emb.unsqueeze(0)
+        tokens = tokens.reshape(B, To * N, D)
+        place = self.goal_from_kpts(feat.reshape(B, To, N, 4)[:, To - 1].reshape(B, -1))
+        uv = out["uv"].reshape(B, To, N, 2)
+        conf = out["conf"].reshape(B, To, N)
+        return uv, conf, place, tokens, out
+
+    def _h_encode(self, nobs, To, train_mask=False, cam_k=None):
+        """The whole H conditioning stack, in ONE place so training / predict_action / the ONNX
+        wrapper cannot drift apart (the F1-depth bug was exactly that drift).
+
+        Returns (vis_cond, aux) where aux carries the perception outputs the losses and the
+        exported graph need: place (rail_a_cam, normalized), kpt uv/conf, kpt 3-D, phase, done."""
+        B = next(iter(nobs.values())).shape[0]
+        this_nobs = {k: v[:, :To] for k, v in nobs.items()}
+        vis_cond = self.obs_encoder(this_nobs).reshape(B, -1, self.obs_feature_dim)
+        # (1) 3D-aware positional ADD on the RGB tokens (zero new tokens, identity at init)
+        if self.rgb3d_proj is not None and 'depth_cam' in this_nobs:
+            n_rgb = self._kpt_grid * self._kpt_grid * To
+            add = self._rgb3d_tokens(this_nobs, To)
+            vis_cond = torch.cat([vis_cond[:, :n_rgb] + add, vis_cond[:, n_rgb:]], dim=1)
+        # (2) typed low-dim tokens + per-key block masking (train only)
+        vis_cond = self._apply_lowdim_typing(vis_cond, To, train_mask=train_mask)
+        # (3) keypoint point tokens from BOTH obs frames
+        uv, conf, place, kpt_tok, extras = self._kpt_and_goal_h(
+            vis_cond, To, depth_z=self._kpt_depth_z_h(this_nobs, To), cam_k=cam_k)
+        vis_cond = torch.cat([vis_cond, kpt_tok], dim=1)
+        # (4) K PointNet tokens
+        if self.pointnet is not None and 'depth_cam' in this_nobs:
+            vis_cond = torch.cat([vis_cond, self._h_pointnet_tokens(this_nobs, To)], dim=1)
+        phase, done = self._h_context(vis_cond)
+        aux = {'place': place, 'kpt_uv': uv, 'kpt_conf': conf,
+               'kpt_extras': extras, 'phase': phase, 'done': done}
+        return vis_cond, aux
+
     # ========= inference  ============
     def _build_lowdim_cond(self, nobs, batch_size, To, device, train_mask=False):
         """Lumi C2: flatten normalized low-dim obs (prev_action/task over the To obs frames)
@@ -427,6 +772,38 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             # assume nobs has 'task_name' key for language condition
             lang_cond = nobs.get('task_name', None)
             assert lang_cond is not None, "Language goal is required"
+
+        # H: ONE shared conditioning path (training / inference / ONNX all call _h_encode) so
+        # the F1-depth class of bug — a token silently present at train and absent at deploy —
+        # cannot recur.
+        if self.h_mode:
+            nobs = dict_apply(nobs, lambda x: x.to(device))
+            vis_cond, aux = self._h_encode(nobs, To, train_mask=False)
+            lowdim_cond = self._build_lowdim_cond(nobs, B, To, device)
+            cond_data = torch.zeros(size=(B, self.action_rows, Da), device=device, dtype=dtype)
+            nsample = self.conditional_sample(
+                cond_data, vis_cond=vis_cond, lang_cond=None,
+                lowdim_cond=lowdim_cond, **self.kwargs)
+            action_pred = self.normalizer['action'].unnormalize(nsample[..., :Da])
+            if self.row0_zero:
+                # delta+cam0: row k=0 is identically zero by construction and is NOT predicted.
+                # Prepend it so the deploy anchor gate tests mis-anchoring only, never intent.
+                action_pred = torch.cat(
+                    [torch.zeros_like(action_pred[:, :1]), action_pred], dim=1)
+            # H rows are anchored AT the obs time (row 0 == the first executable step), so the
+            # legacy `To-1` slice does not apply — take from the top.
+            return {
+                'action': action_pred[:, :self.n_action_steps],
+                'action_pred': action_pred,
+                'place_pred': self.normalizer['rail_a'].unnormalize(aux['place']),
+                'kpt_uv': torch.cat([aux['kpt_uv'][:, To - 1],
+                                     torch.sigmoid(aux['kpt_conf'][:, To - 1]).unsqueeze(-1)],
+                                    dim=-1),
+                'kpt_cam': aux['kpt_extras']['pts3d'].reshape(
+                    B, To, self.n_keypoints, 3)[:, To - 1],
+                'phase': aux['phase'],
+                'done': aux['done'],
+            }
 
         # condition through visual feature
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].to(device))
@@ -730,44 +1107,123 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         den = w.expand_as(per_elem).sum(dim=(1, 2))
         return num / den
 
+    def _h_reframe(self, batch, h_aux):
+        """H: put the action rows (and the goal-coincidence target) in the OUTPUT frame that
+        this sample will actually be supervised in — contract §3.3 scheduled sampling.
+
+        Changing ONLY the expression frame of goal-frame rows is EXACTLY a single fixed
+        rotation of both triplets of every row:
+            R_g_hat = dR @ R_g  =>  v' = M v,  w' = M w   with  M = R_g_hat.T @ R_g
+        and in the anchor-camera frame ("C0", where R_g = R_cv0 @ F) the R_cv0 cancels:
+            M = F_hat.T @ F.
+        That is why the dataset ships F (and the constant map rail_a -> F_hat) instead of the
+        raw world poses: the whole re-framing is three small matmuls, no pose math in torch.
+
+        The self-predicted frame is DETACHED (no second-order gradient through the frame
+        construction); the goal-consistency target deliberately is NOT (that loss exists to push
+        gradient into the place head)."""
+        from maniflow.common.so3_torch import rotmat_to_rotvec, rotvec_to_rotmat
+        dev = self.device
+        action = batch['action'].to(dev).float()
+        out = {'action': action,
+               'remaining': batch['h_goal_remaining'].to(dev).float(),
+               'inreach': batch['h_goal_inreach'].to(dev).float(),
+               'gc_target': None, 'self_frame_frac': 0.0}
+        if self.action_frame != "goal":
+            return out
+        B = action.shape[0]
+        # rail_a_cam in RAW units -> X = exp(rail rotvec); F_hat = X @ (the C0 right-multiplier
+        # that realises "(+) grasp_offset", precomputed by the dataset).
+        place_raw = self.normalizer['rail_a'].unnormalize(h_aux['place'])
+        X = rotvec_to_rotmat(place_raw[..., 3:6])
+        F_gt = batch['h_goal_frame'].to(dev).float()
+        F_hat = X @ batch['h_gc_Rframe'].to(dev).float()
+        F_used = F_gt
+        p = self.goal_frame_self_p()
+        if self.training and p > 0.0:
+            sel = torch.rand(B, 1, 1, device=dev) < p
+            eye = torch.eye(3, device=dev, dtype=action.dtype).expand(B, 3, 3)
+            M = torch.where(sel, F_hat.detach().transpose(1, 2) @ F_gt, eye)
+            out['action'] = torch.cat([
+                torch.einsum('bij,bkj->bki', M, action[..., 0:3]),
+                torch.einsum('bij,bkj->bki', M, action[..., 3:6]),
+                action[..., 6:7]], dim=-1)
+            rem = out['remaining']
+            out['remaining'] = torch.cat([
+                torch.einsum('bij,bj->bi', M, rem[:, 0:3]),
+                torch.einsum('bij,bj->bi', M, rem[:, 3:6])], dim=-1)
+            F_used = torch.where(sel, F_hat.detach(), F_gt)
+            out['self_frame_frac'] = float(sel.float().mean().item())
+        if self.action_param == "delta" and self.goal_consistency_weight > 0.0:
+            # ad(P_0, G_hat, R_g): the remaining transform to the model's OWN goal. P_0 sits at
+            # the anchor so its C0 position is 0 by construction (the dataset anchors p at p_ee0).
+            p_G = place_raw[..., 0:3] + torch.einsum(
+                'bij,bj->bi', X, batch['h_gc_tvec'].to(dev).float()) \
+                - batch['h_gc_eeoff'].to(dev).float()
+            R_G = X @ batch['h_gc_Ree'].to(dev).float()
+            R0 = batch['h_ee0_rot'].to(dev).float()
+            Ft = F_used.transpose(1, 2)
+            out['gc_target'] = torch.cat([
+                torch.einsum('bij,bj->bi', Ft, p_G),
+                rotmat_to_rotvec(Ft @ (R_G @ R0.transpose(1, 2)) @ F_used)], dim=-1)
+        return out
+
     def compute_loss(self, batch, ema_model=None, **kwargs):
         # normalize input
         nobs = self.normalizer.normalize(batch['obs'])
-        nactions = self.normalizer['action'].normalize(batch['action']).to(self.device)
-
-        batch_size = nactions.shape[0]
-        horizon = nactions.shape[1]
 
         # handle different ways of passing observation
         local_cond = None
         vis_cond = None
-        trajectory = nactions
-        cond_data = trajectory
         lang_cond = None
         ema_model = ema_model
+        f_uv = f_conf = f_place = None
+        f_extras = {}
+        h_aux = h_ref = None
 
         if self.language_conditioned:
             # we assume language condition is passed as 'task_name'
             lang_cond = nobs.get('task_name', None)
             assert lang_cond is not None, "Language goal is required"
 
-        # reshape B, T, ... to B*T
-        this_nobs = dict_apply(nobs,
-            lambda x: x[:,:self.n_obs_steps,...].to(self.device))
-        nobs_features = self.obs_encoder(this_nobs)
-        vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
-        # F-series: self-predicted goal token appended to the visual conditioning (actor path).
-        # Gradient from the action loss flows through the goal token -> keypoints -> encoder.
-        f_uv = f_conf = f_place = None
-        f_extras = {}
-        if self.kpt_head is not None:
-            f_uv, f_conf, f_place, _goal_tok, f_extras = self._kpt_and_goal(
-                vis_cond, self.n_obs_steps,
-                depth_z=self._kpt_depth_z(this_nobs, self.n_obs_steps),
+        if self.h_mode:
+            # H: the ENCODER must run BEFORE the action normalization, because the goal-frame
+            # scheduled sampling re-expresses the action rows in the model's own predicted goal
+            # frame — which needs the place head, which needs the encoder. Legacy ordering is
+            # untouched below for every prior arm.
+            nobs_dev = dict_apply(nobs, lambda x: x.to(self.device))
+            vis_cond, h_aux = self._h_encode(
+                nobs_dev, self.n_obs_steps, train_mask=self.training,
                 cam_k=batch.get('cam_k_eff', None))
-            vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
-        if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
-            vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, self.n_obs_steps)], dim=1)
+            h_ref = self._h_reframe(batch, h_aux)
+            nactions = self.normalizer['action'].normalize(h_ref['action']).to(self.device)
+            batch_size = nactions.shape[0]
+        else:
+            nactions = self.normalizer['action'].normalize(batch['action']).to(self.device)
+            batch_size = nactions.shape[0]
+            # reshape B, T, ... to B*T
+            this_nobs = dict_apply(nobs,
+                lambda x: x[:,:self.n_obs_steps,...].to(self.device))
+            nobs_features = self.obs_encoder(this_nobs)
+            vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
+            # F-series: self-predicted goal token appended to the visual conditioning (actor path).
+            # Gradient from the action loss flows through the goal token -> keypoints -> encoder.
+            if self.kpt_head is not None:
+                f_uv, f_conf, f_place, _goal_tok, f_extras = self._kpt_and_goal(
+                    vis_cond, self.n_obs_steps,
+                    depth_z=self._kpt_depth_z(this_nobs, self.n_obs_steps),
+                    cam_k=batch.get('cam_k_eff', None))
+                vis_cond = torch.cat([vis_cond, _goal_tok], dim=1)
+            if self.pointnet is not None and 'depth_cam' in this_nobs:   # F1-depth 3-D token
+                vis_cond = torch.cat([vis_cond, self._pointnet_token(this_nobs, self.n_obs_steps)], dim=1)
+
+        horizon = nactions.shape[1]
+        assert horizon == self.action_rows, (
+            f"action tensor has {horizon} rows but the policy predicts {self.action_rows} "
+            f"(action_param={self.action_param} action_frame={self.action_frame}) — the dataset "
+            f"and policy modes disagree")
+        trajectory = nactions
+        cond_data = trajectory
         # Lumi C2: AdaLN control conditioning; proprio masking active in training only
         lowdim_cond = self._build_lowdim_cond(
             nobs, batch_size, self.n_obs_steps, self.device, train_mask=self.training)
@@ -927,8 +1383,132 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                     place_mm = float(((dist * kd).sum()
                                       / kd.sum().clamp(min=1) * 1000.0).item())
 
+        # ================================================================= H-series losses
+        # Everything here is gated on h_mode; each term has its own weight knob defaulting
+        # to 0 (except action_rate_weight = 0.05, which is the executability guard).
+        h_log = {}
+        if self.h_mode:
+            To = self.n_obs_steps
+            N = self.n_keypoints
+            dev = self.device
+            # ---- keypoints, BOTH obs frames (2x the free supervision of the G1 head) -------
+            from maniflow.model.vision_2d.heatmap_head import heatmap_kpt_loss
+            gt_uv = batch['arm_kpts_uv'][:, :To].to(dev).reshape(-1, N, 3)
+            gt_z = batch['arm_kpts_cam'][:, :To, :, 2].to(dev).reshape(-1, N)
+            lk_heat, lk_pres, lk_z = heatmap_kpt_loss(
+                h_aux['kpt_extras'], gt_uv[..., :2], gt_uv[..., 2], gt_z)
+            lk_total = lk_heat + 0.2 * lk_pres + lk_z
+            loss = loss + self.kpt_loss_weight * lk_total
+            loss_kpt = float(lk_total.item())
+            with torch.no_grad():
+                uvp = h_aux['kpt_uv'].reshape(-1, N, 2)
+                vism = gt_uv[..., 2]
+                scale = torch.tensor([1280.0, 800.0], device=dev, dtype=uvp.dtype)
+                pxe = torch.linalg.norm((uvp - gt_uv[..., :2]) * scale, dim=-1)
+                kpt_px = float(((pxe * vism).sum() / vism.sum().clamp(min=1)).item())
+
+            # ---- place head: target is rail_a_cam, NOT the composed goal ------------------
+            # rail_a is grasp-offset-free, so the perception head learns a pure visual landmark
+            # and the ACTOR composes goal = rail_a (+) grasp_offset (grasp_off is an obs token,
+            # and the C0 composition maps ride along in the batch). This removes the per-episode
+            # grasp variation (+/-25 cm) from the perception target.
+            rail_norm = self.normalizer['rail_a'].normalize(batch['rail_a']).to(dev)
+            lpl_el = F.smooth_l1_loss(h_aux['place'], rail_norm, reduction='none')
+            lpl_b = lpl_el.reshape(lpl_el.shape[0], -1).mean(-1)
+            keep = 1.0 - batch.get('fov_dropped', torch.zeros_like(lpl_b)).to(lpl_b.dtype)
+            lpl = (lpl_b * keep).sum() / keep.sum().clamp(min=1e-6)
+            loss = loss + self.place_loss_weight * lpl
+            loss_place = float(lpl.item())
+            with torch.no_grad():
+                pl_un = self.normalizer['rail_a'].unnormalize(h_aux['place'])
+                rr = batch['rail_a'].to(dev).reshape(pl_un.shape[0], -1)
+                d = torch.linalg.norm(pl_un[:, :3] - rr[:, :3], dim=-1)
+                place_mm = float(((d * keep).sum() / keep.sum().clamp(min=1) * 1000.0).item())
+
+            # ---- observability heads (free supervision, exported for deploy gating) -------
+            if self.phase_loss_weight > 0.0:
+                lph = F.cross_entropy(h_aux['phase'], batch['phase_id'].to(dev).reshape(-1))
+                loss = loss + self.phase_loss_weight * lph
+                h_log['loss_phase'] = float(lph.item())
+                with torch.no_grad():
+                    h_log['phase_acc'] = float((h_aux['phase'].argmax(-1)
+                                                == batch['phase_id'].to(dev).reshape(-1)
+                                                ).float().mean().item())
+            if self.done_loss_weight > 0.0:
+                ldn = F.binary_cross_entropy_with_logits(
+                    h_aux['done'], batch['done'].to(dev).float().reshape(-1, 1))
+                loss = loss + self.done_loss_weight * ldn
+                h_log['loss_done'] = float(ldn.item())
+
+            # ---- action-space constraints, in RAW PHYSICAL UNITS -------------------------
+            # The predicted CHUNK is read off the flow branch's endpoint reconstruction
+            # x1_hat = x_t + (1-t) v_pred (an exact reparameterization of the velocity target),
+            # then unnormalized: metres, radians, m/s, rad/s. Applying these constraints in
+            # normalized space would make their relative weighting depend on the data range.
+            t_f = flow_target_dict['t']
+            omt = (1.0 - t_f).clamp(min=1.0 - self.endpoint_t_clip)
+            rows = self.normalizer['action'].unnormalize(
+                flow_target_dict['x_t'] + omt * v_flow_pred)           # (Bf, rows, 7)
+            Bf = rows.shape[0]
+            if self.action_rate_weight > 0.0:
+                # Executability: the converter MEASURES per-step rates but deliberately does not
+                # clamp labels (clamping breaks the anchored/goal geometry). Feasibility is
+                # enforced HERE (smoothness) and deploy-side by saturation + k=1 replan.
+                seq = rows
+                if self.row0_zero:
+                    # the structural zero row is real at execution time — penalise a jump off it
+                    seq = torch.cat([torch.zeros_like(rows[:, :1]), rows], dim=1)
+                d = seq[:, 1:] - seq[:, :-1]
+                lrate = (d * d).sum(-1).mean()
+                loss = loss + self.action_rate_weight * lrate
+                h_log['loss_rate'] = float(lrate.item())
+
+            if self.action_frame == "goal":
+                dt = 1.0 / self.control_hz
+                if self.action_param == "twist":
+                    # Position integrates EXACTLY in a single fixed frame: sum(v_k dt).
+                    pos = rows[..., 0:3].sum(dim=1) * dt
+                    rv = rows[..., 3:6] * dt
+                    if self.rot_integral_approx:
+                        rot = rv.sum(dim=1)          # ablation: small-angle sum
+                    else:
+                        from maniflow.common.so3_torch import compose_rotvecs
+                        rot = compose_rotvecs(rv)    # proper SO(3) composition
+                else:
+                    # delta+goal: row 0 IS the remaining transform, so the integral constraint
+                    # degenerates to pinning row 0 — still the row the deploy servos on.
+                    pos, rot = rows[:, 0, 0:3], rows[:, 0, 3:6]
+                pred6 = torch.cat([pos, rot], dim=-1)
+                tgt6 = h_ref['remaining'][:Bf]
+                # Valid ONLY where the horizon reaches the goal (see H_GOAL_INTEGRAL_TOL_M in
+                # the dataset): otherwise sum(v dt) == p_last - p_0 != p_goal - p_0 and the
+                # "constraint" would inject the un-covered distance as an error.
+                m = h_ref['inreach'][:Bf].reshape(-1)
+                if self.goal_integral_weight > 0.0:
+                    li_el = F.smooth_l1_loss(pred6, tgt6, reduction='none').mean(-1)
+                    li = (li_el * m).sum() / m.sum().clamp(min=1e-6)
+                    loss = loss + self.goal_integral_weight * li
+                    h_log['loss_goal_int'] = float(li.item())
+                with torch.no_grad():
+                    e = torch.linalg.norm(pred6[:, :3] - tgt6[:, :3], dim=-1)
+                    h_log['goal_int_mm'] = float(
+                        ((e * m).sum() / m.sum().clamp(min=1) * 1000.0).item())
+                if self.terminal_zero_weight > 0.0:
+                    # terminal settle: the last row must contract to zero (twist -> 0 / u -> 0)
+                    lt = F.smooth_l1_loss(rows[:, -1], torch.zeros_like(rows[:, -1]))
+                    loss = loss + self.terminal_zero_weight * lt
+                    h_log['loss_term'] = float(lt.item())
+                if h_ref['gc_target'] is not None and self.goal_consistency_weight > 0.0:
+                    # ties row 0 to the model's OWN goal estimate -> the action loss becomes a
+                    # supervisor of the place head (the anti-shortcut mechanism)
+                    lgc = F.smooth_l1_loss(rows[:, 0, 0:6], h_ref['gc_target'][:Bf])
+                    loss = loss + self.goal_consistency_weight * lgc
+                    h_log['loss_goal_cons'] = float(lgc.item())
+                h_log['self_frame_frac'] = h_ref['self_frame_frac']
+
         loss = loss.mean()
         loss_dict = {
+                **h_log,
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
                 'loss_endpoint': loss_endpoint,

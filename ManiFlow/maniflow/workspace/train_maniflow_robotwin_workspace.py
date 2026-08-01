@@ -338,6 +338,12 @@ class TrainManiFlowRoboTwinWorkspace:
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         for local_epoch_idx in range(cfg.training.num_epochs):
             step_log = dict()
+            # H: drive the goal-frame scheduled-sampling ramp (contract §3.3). The policy keeps
+            # the epoch in a BUFFER so a resumed run continues the anneal instead of restarting
+            # it at 0. No-op for every pre-H arm (hasattr guard).
+            for _m in (self.model, getattr(self, 'ema_model', None)):
+                if _m is not None and hasattr(_m, 'set_epoch'):
+                    _m.set_epoch(self.epoch)
             # ========= train for this epoch ==========
             train_losses = list()
             with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
