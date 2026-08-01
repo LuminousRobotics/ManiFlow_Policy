@@ -528,7 +528,9 @@ class LumiPlaceImageDataset(BaseDataset):
             self.depth_channels = 4          # X, Y, Z (camera frame, /XYZ_SCALE_M) + valid
         else:
             self.depth_channels = 3
-        cprint(f'Loading LumiPlaceImageDataset (v6 anchored, depth='
+        _mode_label = (f'H-series ({action_param}+{action_frame})' if action_param is not None
+                       else 'v6 anchored')
+        cprint(f'Loading LumiPlaceImageDataset ({_mode_label}, depth='
                f'{depth_input if self.use_depth else "OFF"}, '
                f'{self.depth_channels}ch) from {zarr_path}', 'green')
 
