@@ -271,11 +271,13 @@ def pose_from_remaining(p_goal, R_goal, u, R_frame):
 
 # ---------------------------------------------------------------- H action space (contract §3)
 # `action_dim = 7` always: [6-DoF ee_link part | dJ7]. Two orthogonal knobs give the locked 2x2.
-# Row COUNT differs per mode because of what is structurally zero:
-#   twist+cam0 (H0)       15 rows  w_k, k=1..15   (no zero row exists)
+# Row COUNT is per-mode (contract §3, FINAL 2026-07-31). The rule that fixes it:
+# A ROW EXISTS IFF THE MODEL PREDICTS IT AND IT CARRIES INFORMATION.
+#   twist+cam0 (H0)       15 rows  w_k, k=1..15   (no zero row exists by construction)
 #   twist+goal (H1)       15 rows  w_k, k=1..15   (w_15 -> 0 settle + integral constraint)
-#   delta+cam0 (H-delta)  15 rows  a_k, k=1..15   (a_0 == 0 identically -> prepended at EXPORT)
-#   delta+goal (H1-delta) 16 rows  u_k, k=0..15   (u_15 -> 0; u_0 = remaining transform)
+#   delta+cam0 (H-delta)  15 rows  a_k, k=1..15   (a_0 == 0 identically -> NOT a row at all;
+#                                                  nothing is ever prepended anywhere)
+#   delta+goal (H1-delta) 16 rows  u_k, k=0..15   (u_15 -> 0; u_0 IS predicted, see h_action_rows)
 H_ACTION_PARAMS = ("twist", "delta")
 H_ACTION_FRAMES = ("cam0", "goal")
 H_ACTION_DIM = 7
@@ -315,12 +317,40 @@ H_GOAL_INTEGRAL_TOL_M = 0.005      # 5 mm == the terminal precision target
 
 
 def h_action_rows(action_param: str, action_frame: str, pose_horizon: int) -> int:
-    """Number of PREDICTED rows for a mode (contract §3 table). `pose_horizon` = H poses."""
+    """Number of rows for a mode (contract §3 table, FINAL). `pose_horizon` = H poses.
+
+    15 for twist+cam0 / twist+goal / delta+cam0 (k = 1..H-1), 16 for delta+goal (k = 0..H-1).
+
+    Why the counts are NOT uniform. `delta`+`cam0`'s k=0 row is `ad(P_0, P_0, R_cv0)` — the zero
+    vector, always, for every sample and every checkpoint. It is therefore not predicted and not
+    shipped: a constant the exporter inserts itself carries no information, and a runtime gate on
+    it cannot distinguish "mis-anchored" from "wants to move" (the G1 field run rejected 26% of
+    HEALTHY inferences exactly that way). Mis-anchoring is a train/export bug class — a fixed
+    property of a checkpoint — so it is checked once at publish/desk-gate time, not 15x/s.
+
+    `delta`+`goal`'s k=0 row is the opposite case and IS shipped. `u_0 = ad(P_0, G, R_g)` is the
+    remaining transform from the anchor pose to the goal: at deploy `G` is the model's OWN
+    prediction, so `u_0` is that self-predicted goal re-expressed in action space. The same
+    estimate is simultaneously the output coordinate system and a predicted output, which is the
+    flagship's structural coupling made explicit and measurable — pinned from one side by the
+    goal-coincidence integral constraint and from the other by `goal_consistency_weight`. It is
+    load-bearing, not decorative. See `ManiFlowTransformerImagePolicy._h_goal_integral`.
+
+    `action_row_k_start` (1, 1, 1, 0) travels in the ONNX `metadata_props` next to `action_rows`;
+    consumers MUST read both rather than assume a count.
+    """
     assert action_param in H_ACTION_PARAMS, action_param
     assert action_frame in H_ACTION_FRAMES, action_frame
     if action_param == "delta" and action_frame == "goal":
         return int(pose_horizon)            # k = 0..H-1
     return int(pose_horizon) - 1            # k = 1..H-1
+
+
+def h_action_row_k_start(action_param: str, action_frame: str) -> int:
+    """Chunk-step index `k` of the FIRST row (contract §3): 0 for delta+goal, else 1."""
+    assert action_param in H_ACTION_PARAMS, action_param
+    assert action_frame in H_ACTION_FRAMES, action_frame
+    return 0 if (action_param == "delta" and action_frame == "goal") else 1
 
 
 def build_h_action_rows(p_ee, R_ee, q7, p_goal, R_goal, q7_goal,
@@ -782,8 +812,11 @@ class LumiPlaceImageDataset(BaseDataset):
         return out
 
     def _h_all_tcpcam(self):
-        """`tcpcam` over the whole buffer (for the normalizer): ee_link pose in the camera
-        frame at the SAME frame + q7. Cheap enough to vectorize over all frames."""
+        """`tcpcam` over the whole buffer (for the normalizer), vectorized.
+
+        MUST stay identical to the per-sample construction in `_h_sample_to_data` and to the
+        normative contract §4 formula `[R_cv.T @ (p_ee - p_cam), rotvec(R_cv.T @ R_ee), q7]` —
+        a normalizer fit on a different quantity than the model sees is a silent scale bug."""
         rb = self.replay_buffer
         R_cv = quat_wxyz_to_rotmat(np.asarray(rb['cam_quat_cv'][:], np.float64))       # (T,3,3)
         R_ee = quat_wxyz_to_rotmat(np.asarray(rb['ee_quat_w'][:], np.float64))
@@ -1070,17 +1103,35 @@ class LumiPlaceImageDataset(BaseDataset):
         twist = sample['tcp_twist'][pi].astype(np.float32)              # (To,6)
         twist_hist = sample['twist_hist'][pi].astype(np.float32)        # (To,5,6)
         dt = np.full((self.n_obs_steps, 1), dt_true, dtype=np.float32)  # (To,1) TRUE image gap
-        # `tcpcam` = ee_link CONFIGURATION in the camera frame at the same frame + q7. Not
-        # motion: it is where the tool tip sits in camera coordinates, so the servo error
-        # (goal_cam (-) tcp_cam) is expressible; it varies with q7 because the camera rides on
-        # link_6_extension. anchored_delta(cam_pose, ee_pose, R_cv) reduces exactly to
-        # [R_cv.T (p_ee - p_cam) ; rotvec(R_cv.T R_ee)] since the anchor rotation IS R_cv.
+        # ---------------------------------------------------------------------------------
+        # `dt` and `ego` describe DIFFERENT INTERVALS, BY DESIGN. Do not "reconcile" them.
+        #   dt  = the TRUE gap between the two obs IMAGES (0 / 100 / 200 ms under the §5 timing
+        #         aug). It exists so the model knows how much visual parallax to expect.
+        #   ego = the stored `tcp_egomotion`, which is by its §1.2 definition the ee_link
+        #         displacement over ONE control interval (always 100 ms), in the camera frame at
+        #         the previous frame. It is a measured sensor-path quantity.
+        # Re-deriving `ego` over the augmented image gap would silently redefine a key the
+        # converter owns and the deploy node computes from /joint_states — the two clocks really
+        # are different (joint states arrive fast, images do not), and that difference is exactly
+        # what the model must learn to tolerate. Contract §4 is normative on the source.
+        # ---------------------------------------------------------------------------------
+        # `tcpcam` (contract §4, NORMATIVE):
+        #     [ R_cv.T @ (p_ee - p_cam) , rotvec(R_cv.T @ R_ee) , q7 ]
+        # Written out literally so it diffs against the contract text line-for-line. It is
+        # CONFIGURATION, not motion: where the tool tip sits in camera coordinates, so that the
+        # servo error (goal_cam (-) tcp_cam) is expressible at all; it varies with q7 because the
+        # camera rides on link_6_extension. (This is algebraically identical to
+        # anchored_delta(cam_pose, ee_pose, R_cv) — the anchor rotation IS R_cv, so its
+        # R_cv.T (R_ee R_cv.T) R_cv collapses to R_cv.T R_ee — and the test asserts the identity;
+        # the explicit form is preferred here to keep one fewer matmul between us and the spec.)
         tcpcam = np.empty((self.n_obs_steps, 7), dtype=np.float32)
         for j, k in enumerate(pi):
             R_cv = quat_wxyz_to_rotmat(np.asarray(sample['cam_quat_cv'][k], np.float64))
             R_ee = quat_wxyz_to_rotmat(np.asarray(sample['ee_quat_w'][k], np.float64))
-            tcpcam[j, :6] = anchored_delta(sample['cam_pos_w'][k], R_cv,
-                                           sample['ee_pos_w'][k], R_ee, R_cv)
+            dp = np.asarray(sample['ee_pos_w'][k], np.float64) \
+                - np.asarray(sample['cam_pos_w'][k], np.float64)
+            tcpcam[j, :3] = R_cv.T @ dp
+            tcpcam[j, 3:6] = rotmat_to_rotvec(R_cv.T @ R_ee)
             tcpcam[j, 6] = float(np.asarray(sample['q7'][k]).reshape(-1)[0])
 
         # ---------------- action rows + goal bookkeeping ------------------------------------

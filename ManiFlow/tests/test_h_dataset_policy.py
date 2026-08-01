@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from maniflow.dataset import lumi_place_image_dataset as fk                    # noqa: E402
 from maniflow.dataset.lumi_place_image_dataset import (                        # noqa: E402
-    LumiPlaceImageDataset, anchored_delta, build_h_action_rows, h_action_rows,
-    quat_wxyz_to_rotmat, rotvec_to_rotmat, pose_from_remaining, rotz)
+    LumiPlaceImageDataset, anchored_delta, build_h_action_rows, h_action_row_k_start,
+    h_action_rows, quat_wxyz_to_rotmat, rotvec_to_rotmat, pose_from_remaining, rotz)
 
 SEED = 7
 S = 64            # fixture image size (keeps the resnet18 trunk + 2x2 token grid cheap on CPU)
@@ -233,9 +233,66 @@ def test_round_trips():
                   f"pos_err={ep:.2e} rot_err={eR:.2e} terminal="
                   f"{np.abs(rows[-1]).max():.2e}")
 
-    # delta+cam0's row for k=0 is identically zero -> that is why it is prepended, not predicted
+    # delta+cam0's k=0 row is identically zero — that is WHY it is neither predicted nor shipped
+    # (contract §3 FINAL). The check lives HERE, as a test, instead of as a runtime anchor gate:
+    # it is a property of the parameterization, invariant over samples and checkpoints, so a
+    # per-inference gate on it could only ever reject healthy output (the G1 26% lesson).
     a0 = anchored_delta(p_ee[0], R_ee[0], p_ee[0], R_ee[0], R_cv0)
-    assert np.abs(a0).max() < 1e-15
+    assert np.abs(a0).max() < 1e-15, a0
+    rows_dc = build_h_action_rows(p_ee, R_ee, q7, p_goal, R_goal, q7_goal,
+                                  R_cv0, "delta", "cam0", dt)
+    assert rows_dc.shape[0] == 15 and h_action_row_k_start("delta", "cam0") == 1
+    assert h_action_row_k_start("delta", "goal") == 0
+    # ... and the first SHIPPED row is k=1, i.e. genuinely non-zero (nothing was prepended)
+    assert np.abs(rows_dc[0, :6]).max() > 1e-4, rows_dc[0]
+    print(f"  row policy: k=0 row |{np.abs(a0).max():.1e}| (not shipped); first shipped row "
+          f"k=1 |{np.abs(rows_dc[0, :6]).max():.3e}|; k_start 1/1/1/0")
+
+
+def test_tcpcam_formula():
+    """`tcpcam` must match the NORMATIVE contract §4 formula exactly, and (as documentation of
+    why the anchored_delta form the glue agent may use is equivalent) agree with it."""
+    rng = np.random.default_rng(23)
+    for _ in range(200):
+        R_cv = rotvec_to_rotmat(rng.normal(scale=1.0, size=3))
+        R_ee = rotvec_to_rotmat(rng.normal(scale=1.0, size=3))
+        p_cam, p_ee = rng.normal(size=3), rng.normal(size=3)
+        spec = np.concatenate([R_cv.T @ (p_ee - p_cam),
+                               fk.rotmat_to_rotvec(R_cv.T @ R_ee)])
+        ad = anchored_delta(p_cam, R_cv, p_ee, R_ee, R_cv)
+        assert np.abs(spec - ad).max() < 1e-9, (spec, ad)
+    print("  tcpcam: contract formula == anchored_delta(cam, ee, R_cv) to <1e-9 (200 draws)")
+
+
+def test_tcpcam_dataset(zarr_path):
+    """What the DATASET emits for `tcpcam` must be the contract §4 formula evaluated on the
+    zarr rows at the proprio indices — the guard against the dataset and the spec drifting."""
+    ds = LumiPlaceImageDataset(
+        zarr_path=zarr_path, horizon=POSE_H, pad_before=1, pad_after=7, seed=SEED,
+        val_ratio=0.0, use_depth=True, depth_input='xyz', n_obs_steps=2,
+        control_hz=CONTROL_HZ, action_param='twist', action_frame='cam0',
+        augmentation=dict(enable=False))     # clean => proprio idx = [anchor-1, anchor], no DR
+    rb = ds.replay_buffer
+    worst = 0.0
+    for idx in (5, 9, 17, 33):
+        item = ds[idx]
+        # window index w maps to buffer index buffer_start_idx + (w - sample_start_idx);
+        # skip any window whose anchor-1 falls in the front-padded (frame-repeated) region.
+        b_start, _, s_start, _ = (int(v) for v in ds.sampler.indices[idx])
+        if ds.pad_before - 1 < s_start:
+            continue
+        anchor_abs = b_start + (ds.pad_before - s_start)
+        for j, k in enumerate((anchor_abs - 1, anchor_abs)):
+            R_cv = quat_wxyz_to_rotmat(np.asarray(rb['cam_quat_cv'][k], np.float64))
+            R_ee = quat_wxyz_to_rotmat(np.asarray(rb['ee_quat_w'][k], np.float64))
+            want = np.concatenate([
+                R_cv.T @ (np.asarray(rb['ee_pos_w'][k], np.float64)
+                          - np.asarray(rb['cam_pos_w'][k], np.float64)),
+                fk.rotmat_to_rotvec(R_cv.T @ R_ee),
+                np.asarray(rb['q7'][k], np.float64).reshape(1)])
+            worst = max(worst, float(np.abs(item['obs']['tcpcam'][j].numpy() - want).max()))
+    assert worst < 1e-5, worst        # float32 storage
+    print(f"  tcpcam: dataset output == contract formula on the zarr, max err {worst:.2e}")
 
 
 def _make_policy(action_param, action_frame, shape_meta, n_obs_steps=2):
@@ -332,10 +389,14 @@ def test_dataset_and_policy(zarr_path, do_onnx=False):
             policy.eval()
             with torch.no_grad():
                 out = policy.predict_action({k: v[:1] for k, v in batch['obs'].items()})
-            exp_rows = expect_rows + (1 if policy.row0_zero else 0)
-            assert tuple(out['action_pred'].shape) == (1, exp_rows, 7), out['action_pred'].shape
-            if policy.row0_zero:
-                assert float(out['action_pred'][:, 0].abs().max()) == 0.0
+            # contract §3 FINAL: nothing is prepended, so the predicted count IS the shipped
+            # count for every mode (15/15/15/16), and tensor row j is chunk step k_start + j.
+            assert tuple(out['action_pred'].shape) == (1, expect_rows, 7), out['action_pred'].shape
+            assert policy.action_row_k_start == (
+                0 if (action_param, action_frame) == ("delta", "goal") else 1)
+            assert policy.k0_row_structurally_zero == (
+                (action_param, action_frame) == ("delta", "cam0"))
+            assert not hasattr(policy, 'row0_zero'), "row0_zero must be gone (§3 FINAL)"
             assert tuple(out['place_pred'].shape) == (1, 6)
             assert tuple(out['kpt_uv'].shape) == (1, 7, 3)
             assert tuple(out['kpt_cam'].shape) == (1, 7, 3)
@@ -387,7 +448,7 @@ def _onnx_check(policy, ds, action_param, action_frame):
         rep = ex.export_onnx("test.ckpt", out, image_hw=(S, S), prebuilt=bundle)
         md = {p.key: p.value for p in onnx.load(out).metadata_props}
         for req in ("contract_version", "action_param", "action_frame", "action_dim",
-                    "action_rows", "tcp_link", "quat_order", "phase_order", "row0_zero",
+                    "action_rows", "action_row_k_start", "tcp_link", "quat_order", "phase_order",
                     "action_frame_note", "tcp_from_ee", "camera_K", "control_hz",
                     "train_dt_range_s", "driver_limits", "inference_steps",
                     "anchor_residual_p99_mm", "j7_channel", "camera_frame", "resize_policy",
@@ -396,10 +457,18 @@ def _onnx_check(policy, ds, action_param, action_frame):
         assert md["contract_version"] == "h1"
         assert md["action_param"] == action_param and md["action_frame"] == action_frame
         assert md["action_dim"] == "7" and md["tcp_link"] == "ee_link"
-        assert md["row0_zero"] == ("true" if policy.row0_zero else "false")
+        # §3 FINAL: row counts 15/15/15/16, k_start 1/1/1/0, and NO row0_zero key at all
+        assert "row0_zero" not in md, "row0_zero must not be exported (§3 FINAL)"
+        assert int(md["action_rows"]) == {("twist", "cam0"): 15, ("twist", "goal"): 15,
+                                         ("delta", "cam0"): 15, ("delta", "goal"): 16}[
+            (action_param, action_frame)], md["action_rows"]
+        assert int(md["action_row_k_start"]) == (
+            0 if (action_param, action_frame) == ("delta", "goal") else 1)
         assert int(md["action_rows"]) == list(rep["outputs"]["action"]["shape"])[1]
+        assert int(md["action_rows"]) == policy.action_rows
         assert rep["parity"]["passed"], rep["parity"]
         print(f"  onnx  {action_param:5s}/{action_frame:4s}: rows={md['action_rows']} "
+              f"k_start={md['action_row_k_start']} "
               f"max_abs={rep['parity']['max_abs_diff']:.2e} "
               f"per_output={ {k: round(v, 9) for k, v in rep['parity']['per_output_max_abs'].items()} }")
     finally:
@@ -456,9 +525,12 @@ if __name__ == "__main__":
     print("test_h_dataset_policy")
     print(" round-trips:")
     test_round_trips()
+    test_tcpcam_formula()
     tmpd = tempfile.mkdtemp()
     try:
         zp = build_fixture(os.path.join(tmpd, "train.zarr"))
+        print(" obs contract:")
+        test_tcpcam_dataset(zp)
         print(" legacy regression:")
         test_legacy_regression(zp)
         print(" dataset + policy (4 modes, CPU fwd/bwd):")

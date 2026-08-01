@@ -95,12 +95,19 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
         # ------------------------------------------------------------------ H-series switch
-        # `horizon` in H means POSES (H=16). The number of PREDICTED ROWS depends on the mode
-        # (contract §3): 15 for twist/* and delta+cam0 (whose k=0 row is identically zero and is
-        # PREPENDED as a constant at export), 16 for delta+goal (whose row 0 is the remaining
-        # transform, not zero). Everything downstream that is shaped by the action tensor —
-        # DiTX pos_emb, cond_data, the normalizer, eval's noise input — must use the ROW count,
-        # so self.horizon becomes the row count and self.pose_horizon keeps H.
+        # `horizon` in H means POSES (H=16). The row count is per-mode (contract §3, FINAL
+        # 2026-07-31): 15 / 15 / 15 / 16 for twist+cam0 / twist+goal / delta+cam0 / delta+goal.
+        # The rule that fixes it: A ROW IS SHIPPED IFF THE MODEL PREDICTS IT AND IT CARRIES
+        # INFORMATION. `delta`+`cam0`'s k=0 row is identically zero, so it is neither predicted
+        # nor shipped — a constant we insert ourselves is not a signal, and a runtime gate on it
+        # cannot tell "mis-anchored" from "wants to move" (the G1 field run rejected 26% of
+        # HEALTHY inferences that way). `delta`+`goal`'s k=0 row IS predicted: it is the model's
+        # own goal estimate expressed in action space, so it ships (see `_h_goal_integral`).
+        # `action_row_k_start` (1,1,1,0) is the authoritative index of the first shipped row and
+        # travels in metadata_props next to `action_rows`.
+        # Everything downstream that is shaped by the action tensor — DiTX pos_emb, cond_data,
+        # the normalizer, eval's noise input — must use the ROW count, so self.horizon becomes
+        # the row count and self.pose_horizon keeps H.
         self.action_param = action_param
         self.action_frame = str(action_frame)
         self.h_mode = action_param is not None
@@ -108,22 +115,30 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.control_hz = float(control_hz)
         if self.h_mode:
             from maniflow.dataset.lumi_place_image_dataset import (
-                H_ACTION_DIM, H_ACTION_FRAMES, H_ACTION_PARAMS, h_action_rows)
+                H_ACTION_DIM, H_ACTION_FRAMES, H_ACTION_PARAMS,
+                h_action_row_k_start, h_action_rows)
             assert action_param in H_ACTION_PARAMS, f"action_param={action_param!r}"
             assert self.action_frame in H_ACTION_FRAMES, f"action_frame={action_frame!r}"
             assert action_dim == H_ACTION_DIM, (
                 f"H needs action_dim {H_ACTION_DIM} ([6-DoF ee_link | dJ7]); shape_meta says "
                 f"{action_dim}")
             self.action_rows = h_action_rows(action_param, self.action_frame, self.pose_horizon)
-            # row 0 exists in the EXPORTED tensor but is not predicted (delta+cam0 only)
-            self.row0_zero = (action_param == "delta" and self.action_frame == "cam0")
+            # index k of the FIRST shipped row: 0 for delta+goal, 1 for everything else
+            self.action_row_k_start = h_action_row_k_start(action_param, self.action_frame)
+            # ... and whether the (unshipped) k=0 row is structurally zero. Used ONLY by the
+            # action-rate penalty (the row is real at EXECUTION time even though it is not an
+            # output, so the first shipped row must not jump off the anchor) and by the
+            # desk-gate/label tests. Never an output, never a runtime gate.
+            self.k0_row_structurally_zero = (action_param == "delta"
+                                             and self.action_frame == "cam0")
             horizon = self.action_rows
-            cprint(f"[H] {action_param}/{self.action_frame}: {self.action_rows} predicted rows "
-                   f"x {action_dim} dims (poses={self.pose_horizon}, "
-                   f"row0_zero={self.row0_zero})", "green")
+            cprint(f"[H] {action_param}/{self.action_frame}: {self.action_rows} rows "
+                   f"(k={self.action_row_k_start}..{self.action_row_k_start + self.action_rows - 1})"
+                   f" x {action_dim} dims (poses={self.pose_horizon})", "green")
         else:
             self.action_rows = int(horizon)
-            self.row0_zero = False
+            self.action_row_k_start = 0
+            self.k0_row_structurally_zero = False
 
         # --- Lumi C2: low-dim (prev_action/task) -> AdaLN-Zero conditioning ---
         # When enabled the encoder should be configured with lowdim_as_tokens=false so the
@@ -555,6 +570,40 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         pooled = vis_cond.mean(dim=1)
         return self.phase_head(pooled), self.done_head(pooled)
 
+    def _h_goal_integral(self, rows):
+        """The goal-coincidence quantity for the `goal` frames (contract §3.2), as a (B,6)
+        `[pos(3), rotvec(3)]` to be matched against `ad(P_0, G, R_g)` — the remaining transform
+        at the anchor.
+
+        `twist`+`goal` (H1): the INTEGRAL of the predicted profile. Position integrates EXACTLY
+        because every row lives in one fixed frame (Σ v_k Δt == p_last − p_0); rotation
+        integrates by COMPOSITION (Π exp(ω_k Δt)), which is what `compose_rotvecs` does.
+        `rot_integral_approx` selects the small-angle SUM instead, as an ablation — post-yaw-skip
+        total rotation is ≲9°, so the approximation error is ~1e-2 deg (documented, not relied on).
+
+        `delta`+`goal` (H1-delta): the quantity IS row k=0. `u_0 = ad(P_0, G, R_g)` is the
+        remaining transform, so the constraint reduces to pinning the first shipped row — and
+        that is the POINT, not a degeneracy. `u_0` is the model's own goal estimate re-expressed
+        in action space: the same self-predicted goal serves simultaneously as the output
+        coordinate system and as a predicted quantity, so a wrong goal is directly penalised in
+        the units the actor emits. That dual use is the flagship's structural coupling made
+        explicit and measurable (and is why contract §3 FINAL ships this row while dropping
+        `delta`+`cam0`'s structurally-zero one: this row is predicted and load-bearing, that one
+        is a constant). `goal_consistency_weight` closes the same loop from the other side by
+        tying `u_0` to `ad(P_0, Ĝ, R_g)` built from the place head.
+        """
+        dt = 1.0 / self.control_hz
+        if self.action_param == "twist":
+            pos = rows[..., 0:3].sum(dim=1) * dt
+            rv = rows[..., 3:6] * dt
+            if self.rot_integral_approx:
+                rot = rv.sum(dim=1)
+            else:
+                from maniflow.common.so3_torch import compose_rotvecs
+                rot = compose_rotvecs(rv)
+            return torch.cat([pos, rot], dim=-1)
+        return rows[:, 0, 0:6]
+
     def _kpt_and_goal(self, vis_cond, To, depth_z=None, cam_k=None):
         """Slice the most-recent visual frame's tokens from vis_cond (visual tokens come FIRST,
         row-major), reshape to (B,D,g,g), run the keypoint head.
@@ -784,14 +833,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             nsample = self.conditional_sample(
                 cond_data, vis_cond=vis_cond, lang_cond=None,
                 lowdim_cond=lowdim_cond, **self.kwargs)
+            # Every shipped row is PREDICTED (contract §3 FINAL): nothing is prepended. Row j of
+            # the tensor is chunk step k = action_row_k_start + j, which the consumer reads from
+            # metadata_props rather than assuming.
             action_pred = self.normalizer['action'].unnormalize(nsample[..., :Da])
-            if self.row0_zero:
-                # delta+cam0: row k=0 is identically zero by construction and is NOT predicted.
-                # Prepend it so the deploy anchor gate tests mis-anchoring only, never intent.
-                action_pred = torch.cat(
-                    [torch.zeros_like(action_pred[:, :1]), action_pred], dim=1)
-            # H rows are anchored AT the obs time (row 0 == the first executable step), so the
-            # legacy `To-1` slice does not apply — take from the top.
+            # H rows start AT the obs time, so the legacy `To-1` slice does not apply.
             return {
                 'action': action_pred[:, :self.n_action_steps],
                 'action_pred': action_pred,
@@ -1455,8 +1501,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 # clamp labels (clamping breaks the anchored/goal geometry). Feasibility is
                 # enforced HERE (smoothness) and deploy-side by saturation + k=1 replan.
                 seq = rows
-                if self.row0_zero:
-                    # the structural zero row is real at execution time — penalise a jump off it
+                if self.k0_row_structurally_zero:
+                    # delta+cam0: the k=0 row is not an OUTPUT but it is real at EXECUTION time
+                    # (the chunk starts at the anchor), so penalise a jump off it.
                     seq = torch.cat([torch.zeros_like(rows[:, :1]), rows], dim=1)
                 d = seq[:, 1:] - seq[:, :-1]
                 lrate = (d * d).sum(-1).mean()
@@ -1464,21 +1511,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 h_log['loss_rate'] = float(lrate.item())
 
             if self.action_frame == "goal":
-                dt = 1.0 / self.control_hz
-                if self.action_param == "twist":
-                    # Position integrates EXACTLY in a single fixed frame: sum(v_k dt).
-                    pos = rows[..., 0:3].sum(dim=1) * dt
-                    rv = rows[..., 3:6] * dt
-                    if self.rot_integral_approx:
-                        rot = rv.sum(dim=1)          # ablation: small-angle sum
-                    else:
-                        from maniflow.common.so3_torch import compose_rotvecs
-                        rot = compose_rotvecs(rv)    # proper SO(3) composition
-                else:
-                    # delta+goal: row 0 IS the remaining transform, so the integral constraint
-                    # degenerates to pinning row 0 — still the row the deploy servos on.
-                    pos, rot = rows[:, 0, 0:3], rows[:, 0, 3:6]
-                pred6 = torch.cat([pos, rot], dim=-1)
+                pred6 = self._h_goal_integral(rows)
                 tgt6 = h_ref['remaining'][:Bf]
                 # Valid ONLY where the horizon reaches the goal (see H_GOAL_INTEGRAL_TOL_M in
                 # the dataset): otherwise sum(v dt) == p_last - p_0 != p_goal - p_0 and the
