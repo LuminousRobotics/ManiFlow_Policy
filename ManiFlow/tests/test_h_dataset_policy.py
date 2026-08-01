@@ -523,11 +523,22 @@ def test_dataset_and_policy(zarr_path, do_onnx=False):
             assert tuple(out['phase'].shape) == (1, 2)
             assert tuple(out['done'].shape) == (1, 1)
 
-            # val split must be clean AND nominal-timed (gap 1, lag 0)
+            # val split must be clean AND nominal-timed (gap 1, lag 0) — with ONE honest
+            # exception (contract §9.4): at an episode-start window the sampler front-pads by
+            # repeating frame 0, so the two "obs images" are byte-identical duplicates and dt
+            # reports 0, not the nominal 100 ms. dt never lies; gap=0 is a real modelled failure
+            # mode, so claiming parallax that is not in the pixels would be training a lie.
             vds = ds.get_validation_dataset()
-            vb = next(iter(DataLoader(vds, batch_size=2, shuffle=False)))
-            assert abs(float(vb['obs']['dt'].min()) - 0.1) < 1e-6
-            assert abs(float(vb['obs']['dt'].max()) - 0.1) < 1e-6
+            vdt = np.concatenate([vds[i]['obs']['dt'].numpy().reshape(-1)
+                                  for i in range(len(vds))])
+            assert np.all(np.isclose(vdt, 0.0) | np.isclose(vdt, 0.1)), sorted(set(vdt.tolist()))
+            n_pad = int(np.isclose(vdt, 0.0).sum())
+            # dt is 0 exactly on windows whose front padding swallows the previous obs frame,
+            # i.e. sample_start_idx >= anchor (= pad_before); each sample carries To dt entries.
+            want_pad = sum(vds.n_obs_steps * int(int(vds.sampler.indices[i][2]) >= vds.pad_before)
+                           for i in range(len(vds)))
+            assert n_pad == want_pad and n_pad > 0, (n_pad, want_pad)
+            assert np.isclose(float(vdt.max()), 0.1)
 
             results[(action_param, action_frame)] = dict(
                 loss=float(loss.item()), rows=expect_rows, gnorm=gnorm,
@@ -559,9 +570,13 @@ def _onnx_check(policy, ds, action_param, action_frame):
     torch.nn.init.normal_(policy.model.final_layer.ffn_final.fc2.weight, std=0.05)
     torch.nn.init.normal_(policy.model.final_layer.ffn_final.fc2.bias, std=0.05)
     policy.cam_k_norm_buf.copy_(torch.as_tensor(ds.cam_k_norm, dtype=torch.float32))
+    # `control_hz` is a DATASET property (contract §9.6) and the exporter refuses to guess it, so
+    # the bundle must carry a cfg that has it — exactly what a real checkpoint carries.
+    from omegaconf import OmegaConf as _OC
     bundle = {"wrapper": ex._build_wrapper(policy)[0],
               "obs_keys": list(ex.H_INPUT_ORDER), "policy": policy,
-              "cfg": None, "weights_used": "test", "deploy_inference_steps": 2}
+              "cfg": _OC.create({"robotwin_task": {"dataset": {"control_hz": CONTROL_HZ}}}),
+              "weights_used": "test", "deploy_inference_steps": 2}
     tmp = tempfile.mkdtemp()
     out = os.path.join(tmp, "policy.onnx")
     try:
@@ -571,7 +586,7 @@ def _onnx_check(policy, ds, action_param, action_frame):
                     "action_rows", "action_row_k_start", "tcp_link", "quat_order", "phase_order",
                     "action_frame_note", "tcp_from_ee", "camera_K", "control_hz",
                     "train_dt_range_s", "driver_limits", "inference_steps",
-                    "anchor_residual_p99_mm", "j7_channel", "camera_frame", "resize_policy",
+                    "j7_channel", "camera_frame", "resize_policy",
                     "units", "goal_composition", "place_pred_meaning", "keypoint_order"):
                 assert req in md and md[req] != "", f"metadata_props missing {req}: {md}"
         assert md["contract_version"] == "h1"
@@ -579,7 +594,13 @@ def _onnx_check(policy, ds, action_param, action_frame):
         # what place_pred actually means (panel goal, not rail_a).
         assert "inv(T_tcp_panel)" in md["goal_composition"], md["goal_composition"]
         assert "panel_goal_cam" in md["place_pred_meaning"]
-        assert "edge_n,edge_f" in md["keypoint_order"]
+        # §1.4/§9.6: the neighbour-edge keypoints are `edge_p`,`edge_q` (converter-authoritative);
+        # the earlier `edge_n`/`edge_f` spelling was drift and never existed producer-side.
+        assert "edge_p,edge_q" in md["keypoint_order"], md["keypoint_order"]
+        # §6.3 FINAL / §9.6: the runtime anchor gate is deleted by design, so the metadata it fed
+        # must NOT be written (the desk gate WARNs on its presence).
+        assert "anchor_residual_p99_mm" not in md, "anchor_residual_p99_mm must not be exported"
+        assert "row0_zero" not in md
         assert md["action_param"] == action_param and md["action_frame"] == action_frame
         assert md["action_dim"] == "7" and md["tcp_link"] == "ee_link"
         # §3 FINAL: row counts 15/15/15/16, k_start 1/1/1/0, and NO row0_zero key at all
