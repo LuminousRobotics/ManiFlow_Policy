@@ -302,7 +302,7 @@ H_REQUIRED_ZARR_KEYS = (
     'goal_pos_cam', 'goal_rot_cam',
     'ee_pos_w', 'ee_quat_w', 'q7',
     'ee_goal_pos_w', 'ee_goal_quat_w', 'q7_goal',
-    'rail_a_cam', 'grasp_offset',
+    'panel_goal_cam', 'rail_a_cam', 'grasp_offset',
     'tcp_egomotion', 'tcp_twist', 'twist_hist',
     'phase_id', 'done',
 )
@@ -393,47 +393,79 @@ def build_h_action_rows(p_ee, R_ee, q7, p_goal, R_goal, q7_goal,
     return np.concatenate([six, dj7.reshape(-1, 1)], axis=1)
 
 
-def rail_to_ee_goal_maps(R_tcp0_cam, ee_minus_tcp_cam, grasp_offset, q7_goal,
-                         invert_offset: bool = True):
-    """Precompute the (tiny) constant maps that turn a PREDICTED `rail_a_cam` into the ee_link
-    goal + goal frame, all expressed in the camera frame at the anchor ("C0").
+# `grasp_offset` composition convention — SETTLED EMPIRICALLY (contract §1.2a, 2026-07-31).
+# `grasp_offset` stores T_tcp_panel (the panel pose IN THE TCP FRAME), NOT pre-inverted, so the
+# TCP goal is recovered by composing with its INVERSE. Measured residuals against the stored goal:
+#     T_panel_goal @ inv(T_tcp_panel)   0.28-0.90 mm   <- THIS ONE
+#     T_panel_goal @      T_tcp_panel   274.6 mm
+#     T_railA      @ inv(T_tcp_panel)   620-1020 mm    (wrong LANDMARK, see §1.2b)
+#     T_railA      @      T_tcp_panel   879-1019 mm
+GRASP_OFFSET_INVERT = True
 
-    WHY this lives in the dataset: the actor composes `goal = rail_a (+) grasp_offset` (contract
-    §4 / plan §2.2), but the policy only sees NORMALIZED tokens — it has no access to the raw
-    current TCP orientation `R_tcp0` needed for the composition. These four constants make the
-    policy-side composition three matmuls, exactly and differentiably, with no new obs input.
+# THE MILLIMETRE TERM IS THE DISCRIMINATOR, NOT THE ANGLE. This grasp is a ~180 deg rotation and a
+# 180 deg rotation is its own inverse, so a wrong (non-inverted) convention shifts the reconstructed
+# ORIENTATION by only ~0.07 deg while shifting POSITION by 275 mm. Any check that looks at
+# orientation alone silently passes the wrong convention. Gate on position.
+#
+# Tolerance is 50 mm, matching the converter's `grasp_goal_max_mm`, and NOT because the geometry is
+# sloppy: the stored TCP goal is currently built as the conjugation
+# `T_tcp_end @ inv(T_panel_end) @ T_panel_goal`, which differs from the rigid-grasp composition by
+# `(R_grasp.T - I) @ R_tcp_end.T @ (p_panel_goal - p_panel_end)` — bounded by 2*place_err, i.e.
+# <=~40 mm at the 20 mm place_err QA gate and 0.28-0.90 mm in practice. The converter owner is
+# switching to the rigid form, after which this residual becomes ~0; expect the logged number to
+# DROP sub-millimetre and do not read that as a regression. A wrong convention is 275-1020 mm out,
+# so 50 mm still separates the failure class by 5-20x.
+GRASP_PROBE_MAX_POS_M = 0.050
+GRASP_PROBE_MAX_ROT_RAD = np.radians(1.0)
 
-    Derivation. Let X = exp(rail_a_cam[3:]) and r_p = rail_a_cam[:3], so
-        R_cv0.T @ R_railA = X @ R_tcp0_cam            and   R_cv0.T @ (p_railA - p_tcp0) = r_p.
-    The panel must LAND on rail_a, i.e. T_world_panel == T_world_railA, and grasp_offset is
-    T_tcp_panel, so  T_world_tcpgoal = T_world_railA @ inv(T_tcp_panel):
-        R_gt = R_railA @ R_off.T ,  p_gt = p_railA - R_railA @ R_off.T @ p_off
-    then ee_link (contract §0):
-        R_ge = R_gt @ Rz(-q7_goal) ,  p_ge = p_gt + R_gt @ [0, +Y, 0]
-    Pushing through into C0 and re-anchoring the position at p_ee0 gives
-        p_goal_ee (in C0, rel. p_ee0) = r_p + X @ tvec - ee_minus_tcp_cam
-        R_goal_ee (in C0)             = X @ R_ee
-        goal FRAME (in C0)            = X @ R_frame          [ == exp(goal_rot_cam) ]
-    `invert_offset=False` selects the alternate convention T_world_railA @ T_tcp_panel; which
-    one the producer used is PROBED at dataset init (`_probe_grasp_offset_convention`) and the
-    mismatch fails loud.
+
+def panel_to_ee_goal_maps(R_tcp0_cam, cam_minus_ee_cam, grasp_offset, q7_goal,
+                          invert_offset: bool = GRASP_OFFSET_INVERT):
+    """Precompute the (tiny) constant maps that turn a PREDICTED `panel_goal_cam` into the ee_link
+    goal + the goal frame, all expressed in the camera frame at the anchor ("C0").
+
+    WHY THE PANEL GOAL AND NOT `rail_a` (contract §1.2b, measured on real episodes): in the rail
+    frame the panel goal has x fixed at exactly module_width/2 but **y free over 0.19 m** and z
+    jittering 24 mm. `goal = f(rail_a, grasp_offset)` is therefore UNDER-DETERMINED by one
+    translational DoF — a panel is placed flush against the previously installed panel, so the
+    along-rail DoF comes from the NEIGHBOUR EDGE (keypoints 5-6), not from the rail. The place head
+    consequently regresses the panel goal directly; `rail_a_cam` survives only as an aux landmark.
+
+    WHY this lives in the dataset: the policy only sees NORMALIZED tokens and has no access to the
+    raw camera/TCP pose the composition needs. These four constants make the policy-side
+    composition three matmuls, exactly and differentiably, with no new obs input.
+
+    Derivation. `panel_goal_cam` is camera-frame-ABSOLUTE (unlike `rail_a_cam`), so with
+    Y = exp(panel_goal_cam[3:6]) and c_p = panel_goal_cam[0:3]:
+        R_cv0.T @ R_panel_goal = Y        and     R_cv0.T @ (p_panel_goal - p_cam0) = c_p.
+    With Q := inv(T_tcp_panel) (invert_offset=True; §1.2a) = (Rq, pq) = (R_off.T, -R_off.T @ p_off),
+        T_tcp_goal = T_panel_goal @ Q  =>  R_gt = R_panel_goal @ Rq,
+                                           p_gt = p_panel_goal + R_panel_goal @ pq
+    then ee_link (contract §0): R_ge = R_gt @ Rz(-q7_goal), p_ge = p_gt + R_gt @ [0, +Y_OFF, 0].
+    Pushing into C0 and re-anchoring the position at p_ee0:
+        p_goal_ee (in C0, rel. p_ee0) = c_p + Y @ tvec + cam_minus_ee_cam
+        R_goal_ee (in C0)             = Y @ R_ee
+        goal FRAME (in C0)            = Y @ R_frame        [ == exp(goal_rot_cam) ]
+    `cam_minus_ee_cam` = R_cv0.T @ (p_cam0 - p_ee0) re-anchors from the camera (where
+    `panel_goal_cam` lives) to p_ee0 (where the action rows are anchored).
+
+    `invert_offset=False` selects the WRONG convention and exists only so
+    `_probe_grasp_offset_convention` can measure the discrimination margin. Do not set it.
     """
     R_tcp0_cam = np.asarray(R_tcp0_cam, dtype=np.float64)
-    ee_minus_tcp_cam = np.asarray(ee_minus_tcp_cam, dtype=np.float64).reshape(3)
+    cam_minus_ee_cam = np.asarray(cam_minus_ee_cam, dtype=np.float64).reshape(3)
     go = np.asarray(grasp_offset, dtype=np.float64).reshape(7)
     p_off, R_off = go[:3], quat_wxyz_to_rotmat(go[3:])
-    if invert_offset:
-        Ct = R_tcp0_cam @ R_off.T          # C0 rotation part of R_cv0.T @ R_gt, right of X
-        c1 = -(Ct @ p_off)                 # C0 translation part, right of X
-    else:
-        Ct = R_tcp0_cam @ R_off
-        c1 = R_tcp0_cam @ p_off
-    tvec = c1 + Ct @ np.array([0.0, EE_TCP_Y_OFFSET_M, 0.0])
+    if invert_offset:                       # Q = inv(T_tcp_panel)   <- contract §1.2a
+        Rq, pq = R_off.T, -(R_off.T @ p_off)
+    else:                                   # Q = T_tcp_panel        (diagnostic only)
+        Rq, pq = R_off, p_off
+    tvec = pq + Rq @ np.array([0.0, EE_TCP_Y_OFFSET_M, 0.0])
     return {
-        "tvec": tvec.astype(np.float32),                        # (3,)
-        "eeoff": ee_minus_tcp_cam.astype(np.float32),           # (3,)
-        "R_ee": (Ct @ rotz(-float(q7_goal))).astype(np.float32),   # (3,3)
-        "R_frame": (Ct @ R_tcp0_cam.T).astype(np.float32),      # (3,3)
+        "tvec": tvec.astype(np.float32),                            # (3,)
+        "toff": cam_minus_ee_cam.astype(np.float32),                # (3,)
+        "R_ee": (Rq @ rotz(-float(q7_goal))).astype(np.float32),    # (3,3)
+        "R_frame": (Rq @ R_tcp0_cam.T).astype(np.float32),          # (3,3)
     }
 
 
@@ -637,60 +669,83 @@ class LumiPlaceImageDataset(BaseDataset):
             raise ValueError(f"H timing probs must be {n} non-negative values summing to 1; got {p}")
         return p
 
-    def _probe_grasp_offset_convention(self, n_probe: int = 16) -> bool:
-        """Pin the `grasp_offset` composition convention against the STORED ground truth.
-
-        The actor composes `goal = rail_a (+) grasp_offset` (contract §4). `grasp_offset` is
-        documented as `T_tcp_panel`, which implies `T_world_tcpgoal = T_world_railA @
-        inv(T_tcp_panel)` — but the sign of a stored offset is exactly the kind of thing that
-        silently flips between producer and consumer (the 59.5 mm ee/tcp ambiguity in §0 is the
-        same failure class). So verify it numerically: for real frames, the map built by
-        `rail_to_ee_goal_maps` from the STORED `rail_a_cam` must reproduce the STORED
-        `goal_rot_cam` / `ee_goal_*`. Fails loud when NEITHER convention matches.
-        Returns True for the inverse (documented) convention."""
+    def _goal_compose_residual(self, idx: int, invert: bool):
+        """Reconstruct the ee_link goal from the STORED `panel_goal_cam` + `grasp_offset` at one
+        frame and return (rotation error [rad], position error [m]) vs the stored goal."""
         rb = self.replay_buffer
-        n = int(rb['rail_a_cam'].shape[0])
+        R_cv0 = quat_wxyz_to_rotmat(rb['cam_quat_cv'][idx])
+        R_tcp0 = quat_wxyz_to_rotmat(rb['tcp_quat_w'][idx])
+        p_cam0 = np.asarray(rb['cam_pos_w'][idx], np.float64)
+        p_ee0 = np.asarray(rb['ee_pos_w'][idx], np.float64)
+        m = panel_to_ee_goal_maps(
+            R_cv0.T @ R_tcp0, R_cv0.T @ (p_cam0 - p_ee0),
+            rb['grasp_offset'][idx], float(np.asarray(rb['q7_goal'][idx]).reshape(-1)[0]),
+            invert_offset=invert)
+        pg = np.asarray(rb['panel_goal_cam'][idx], np.float64).reshape(6)
+        Y = rotvec_to_rotmat(pg[3:])
+        # (a) goal FRAME: Y @ R_frame must equal exp(goal_rot_cam)
+        F_pred = Y @ np.asarray(m["R_frame"], np.float64)
+        F_gt = rotvec_to_rotmat(np.asarray(rb['goal_rot_cam'][idx], np.float64).reshape(3))
+        e_rot = float(np.abs(rotmat_to_rotvec(F_pred @ F_gt.T)).max())
+        # (b) ee goal POSITION in C0 relative to p_ee0 — the discriminating term
+        p_pred = pg[:3] + Y @ np.asarray(m["tvec"], np.float64) \
+            + np.asarray(m["toff"], np.float64)
+        p_gt = R_cv0.T @ (np.asarray(rb['ee_goal_pos_w'][idx], np.float64) - p_ee0)
+        e_pos = float(np.linalg.norm(p_pred - p_gt))
+        return e_rot, e_pos
+
+    def _probe_grasp_offset_convention(self, n_probe: int = 16) -> bool:
+        """Verify the `grasp_offset` composition against the STORED ground truth. FAIL LOUD.
+
+        Contract §1.2a settled the convention empirically (`invert=True`, i.e. `T_tcp_goal =
+        T_panel_goal @ inv(T_tcp_panel)`) and says consumers must not *choose* at runtime. This is
+        not a chooser — it is a guard, and it stays because the earlier version of this probe
+        would have hard-failed on BOTH of its branches and that firing WOULD HAVE BEEN CORRECT:
+        it was composing from `rail_a`, and the landmark is the PANEL GOAL (§1.2b). A cheap check
+        that catches an architecture error is worth keeping even once the convention is known.
+
+        Two traps it is built to avoid:
+          1. ORIENTATION CANNOT DISCRIMINATE. The grasp is ~180 deg and a 180 deg rotation is its
+             own inverse, so the wrong convention moves orientation by ~0.07 deg and position by
+             275 mm. The gate is therefore on POSITION (rotation is reported, and gated loosely
+             only to catch a gross frame error).
+          2. The stored goal currently carries the converter's conjugation-vs-rigid-grasp
+             difference (<= ~2*place_err). Hence GRASP_PROBE_MAX_POS_M = 50 mm, not 1 mm — see the
+             note on that constant.
+
+        Returns `GRASP_OFFSET_INVERT`; raises if the settled convention does not reproduce the
+        stored goal."""
+        rb = self.replay_buffer
+        n = int(rb['panel_goal_cam'].shape[0])
         rng = np.random.default_rng([self.seed, 20260731])
-        idxs = rng.choice(n, size=min(n_probe, n), replace=False)
+        idxs = [int(i) for i in rng.choice(n, size=min(n_probe, n), replace=False)]
         errs = {}
         for invert in (True, False):
-            e_rot, e_pos = 0.0, 0.0
-            for i in idxs:
-                i = int(i)
-                R_cv0 = quat_wxyz_to_rotmat(rb['cam_quat_cv'][i])
-                R_tcp0 = quat_wxyz_to_rotmat(rb['tcp_quat_w'][i])
-                p_tcp0 = np.asarray(rb['tcp_pos_w'][i], np.float64)
-                p_ee0 = np.asarray(rb['ee_pos_w'][i], np.float64)
-                m = rail_to_ee_goal_maps(
-                    R_cv0.T @ R_tcp0, R_cv0.T @ (p_ee0 - p_tcp0),
-                    rb['grasp_offset'][i], float(np.asarray(rb['q7_goal'][i]).reshape(-1)[0]),
-                    invert_offset=invert)
-                rail = np.asarray(rb['rail_a_cam'][i], np.float64).reshape(6)
-                X = rotvec_to_rotmat(rail[3:])
-                # goal frame: X @ R_frame must equal exp(goal_rot_cam)
-                F_pred = X @ np.asarray(m["R_frame"], np.float64)
-                F_gt = rotvec_to_rotmat(np.asarray(rb['goal_rot_cam'][i], np.float64).reshape(3))
-                e_rot = max(e_rot, float(np.abs(rotmat_to_rotvec(F_pred @ F_gt.T)).max()))
-                # ee goal position in C0 relative to p_ee0
-                p_pred = rail[:3] + X @ np.asarray(m["tvec"], np.float64) \
-                    - np.asarray(m["eeoff"], np.float64)
-                p_gt = R_cv0.T @ (np.asarray(rb['ee_goal_pos_w'][i], np.float64) - p_ee0)
-                e_pos = max(e_pos, float(np.abs(p_pred - p_gt).max()))
-            errs[invert] = (e_rot, e_pos)
-        best = min(errs, key=lambda k: errs[k][0] + errs[k][1])
-        e_rot, e_pos = errs[best]
-        if e_rot > 1e-3 or e_pos > 1e-3:                    # 1 mrad / 1 mm
+            rs, ps = zip(*(self._goal_compose_residual(i, invert) for i in idxs))
+            errs[invert] = (max(rs), max(ps))
+        e_rot, e_pos = errs[GRASP_OFFSET_INVERT]
+        e_pos_other = errs[not GRASP_OFFSET_INVERT][1]
+        if e_pos > GRASP_PROBE_MAX_POS_M or e_rot > GRASP_PROBE_MAX_ROT_RAD:
             raise ValueError(
-                "grasp_offset composition does not reproduce the stored goal. "
-                f"invert=True err(rot_rad,pos_m)={errs[True]}, invert=False={errs[False]}. "
-                "Either the producer's `grasp_offset`/`rail_a_cam`/`ee_goal_*` conventions "
-                "changed or `rail_to_ee_goal_maps` is wrong — do NOT train through this.")
-        if not best:
-            cprint("[H] WARNING: grasp_offset matches the NON-inverse convention "
-                   "(T_world_railA @ T_tcp_panel). Using it; tell the converter owner.", "yellow")
-        cprint(f"[H] grasp_offset convention verified: invert={best} "
-               f"(rot {e_rot:.2e} rad, pos {e_pos:.2e} m)", "green")
-        return bool(best)
+                "grasp_offset composition does NOT reproduce the stored ee_link goal "
+                f"(contract §1.2a says invert={GRASP_OFFSET_INVERT}). "
+                f"invert=True err(rot_rad, pos_m)={errs[True]}, invert=False={errs[False]}; "
+                f"gates {GRASP_PROBE_MAX_ROT_RAD:.4f} rad / {GRASP_PROBE_MAX_POS_M} m.\n"
+                "Read the POSITION column, not the angle — a ~180 deg grasp is its own inverse, "
+                "so a wrong convention barely moves the angle.\n"
+                "If BOTH branches are ~0.6-1 m out the LANDMARK is wrong, not the sign: the goal "
+                "is the PANEL GOAL frame, not rail_a (§1.2b). Do NOT train through this.")
+        # A healthy dataset must also show the failure class is far away; if the two branches are
+        # indistinguishable the probe is not actually testing anything (e.g. a degenerate grasp).
+        if e_pos_other < 10.0 * max(e_pos, 1e-4):
+            cprint(f"[H] WARNING: grasp convention probe has a weak margin "
+                   f"(correct {e_pos * 1000:.2f} mm vs wrong {e_pos_other * 1000:.2f} mm) — it "
+                   f"would not catch an inverted store on this data.", "yellow")
+        cprint(f"[H] grasp_offset composition verified from panel_goal_cam: "
+               f"invert={GRASP_OFFSET_INVERT}, residual {e_pos * 1000:.3f} mm / "
+               f"{np.degrees(e_rot):.4f} deg (gate {GRASP_PROBE_MAX_POS_M * 1000:.0f} mm; "
+               f"wrong-convention branch {e_pos_other * 1000:.1f} mm)", "green")
+        return GRASP_OFFSET_INVERT
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -839,7 +894,12 @@ class LumiPlaceImageDataset(BaseDataset):
                       / self.control_hz).reshape(-1, 1)
         data = {
             'action': self._h_all_action_rows(),
-            'rail_a': np.asarray(rb['rail_a_cam'][:], np.float32),          # place-head target
+            # PRIMARY place-head target (§1.2b): the panel's target pose, camera-frame-ABSOLUTE.
+            'panel_goal': np.asarray(rb['panel_goal_cam'][:], np.float32),
+            # AUX landmark target only, and a DIFFERENT CONVENTION (TCP-anchored delta). Fit
+            # separately — sharing a normalizer between an absolute pose and a delta would be
+            # a silent scale error.
+            'rail_a': np.asarray(rb['rail_a_cam'][:], np.float32),
             'task': np.asarray(rb['task'][:], np.float32),
             'agent_pos': np.asarray(rb['agent_pos'][:], np.float32),
             'grasp_off': np.asarray(rb['grasp_offset'][:], np.float32),
@@ -853,7 +913,7 @@ class LumiPlaceImageDataset(BaseDataset):
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
         normalizer['head_cam'] = SingleFieldLinearNormalizer.create_identity()
         normalizer['depth_cam'] = SingleFieldLinearNormalizer.create_identity()
-        missing = [k for k in H_OBS_KEYS + ('action', 'rail_a')
+        missing = [k for k in H_OBS_KEYS + ('action', 'panel_goal', 'rail_a')
                    if k not in normalizer.params_dict]
         assert not missing, f"H normalizer missing fields {missing} (would pass through raw)"
         return normalizer
@@ -1140,13 +1200,14 @@ class LumiPlaceImageDataset(BaseDataset):
                   else self._h_goal_perturbation(sample_rng))
         action, extras = self._h_build_rows(g, dR, dp)
 
-        # Constant maps that let the POLICY compose goal = rail_a (+) grasp_offset in C0
-        # (see rail_to_ee_goal_maps). Training-only: never an obs input, never in the ONNX graph.
-        gc = rail_to_ee_goal_maps(
+        # Constant maps that let the POLICY compose the ee_link goal (and the goal FRAME) from its
+        # own predicted `panel_goal_cam` (+) `grasp_offset`, in C0 — see `panel_to_ee_goal_maps`.
+        # Training-only: never an obs input, never in the ONNX graph.
+        gc = panel_to_ee_goal_maps(
             g['R_cv0'].T @ quat_wxyz_to_rotmat(np.asarray(sample['tcp_quat_w'][anchor], np.float64)),
-            g['R_cv0'].T @ (g['p_ee'][0] - np.asarray(sample['tcp_pos_w'][anchor], np.float64)),
+            g['R_cv0'].T @ (np.asarray(sample['cam_pos_w'][anchor], np.float64) - g['p_ee'][0]),
             sample['grasp_offset'][anchor], g['q7_goal'],
-            invert_offset=getattr(self, 'grasp_offset_invert', True))
+            invert_offset=getattr(self, 'grasp_offset_invert', GRASP_OFFSET_INVERT))
 
         # ---------------- augmentation ------------------------------------------------------
         if self.augment and ep_idx is not None:
@@ -1196,14 +1257,18 @@ class LumiPlaceImageDataset(BaseDataset):
         out = {
             'obs': obs,
             'action': action,                                                    # (rows,7)
-            # place head target (contract §3.2): rail_a_cam is GRASP-OFFSET-FREE, so the
-            # perception head learns a pure visual landmark and the actor composes the goal.
+            # PRIMARY place-head target (§1.2b): the PANEL's target pose, camera-frame-ABSOLUTE.
+            # It is grasp-offset-free (a scene property) AND it is identifiable, which `rail_a`
+            # is not — the along-rail DoF is free by 0.19 m relative to the rail.
+            'panel_goal': sample['panel_goal_cam'][anchor].astype(np.float32),   # (6,)
+            # AUX landmark grounding ONLY, and note the DIFFERENT CONVENTION: a TCP-anchored
+            # delta, not a camera-absolute pose. Inter-convertible via `tcpcam`, never equal.
             'rail_a': sample['rail_a_cam'][anchor].astype(np.float32),           # (6,)
             'arm_kpts_uv': sample['arm_kpts_uv'][pi].astype(np.float32),         # (To,N,3)
             'arm_kpts_cam': sample['arm_kpts_cam'][pi].astype(np.float32),       # (To,N,3)
             'phase_id': sample['phase_id'][anchor].astype(np.int64).reshape(1),  # (1,)
             'done': sample['done'][anchor].astype(np.float32).reshape(1),        # (1,)
-            'h_gc_tvec': gc['tvec'], 'h_gc_eeoff': gc['eeoff'],
+            'h_gc_tvec': gc['tvec'], 'h_gc_toff': gc['toff'],
             'h_gc_Ree': gc['R_ee'], 'h_gc_Rframe': gc['R_frame'],
         }
         out.update(extras)

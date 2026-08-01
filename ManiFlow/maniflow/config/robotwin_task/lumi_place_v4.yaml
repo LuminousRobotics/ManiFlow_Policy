@@ -74,6 +74,18 @@ shape_meta:
 
 # Token budget (contract §4): 98 RGB + 14 kpt (7 x BOTH obs frames) + 16 PointNet
 # + 19 low-dim = 147 of 256 (visual_cond_len 128 x n_obs_steps 2). The policy asserts this.
+#
+# PLACE HEAD TARGET (contract §1.2b): `panel_goal_cam` — the PANEL's target pose, camera-frame
+# ABSOLUTE. NOT `rail_a_cam`: measured on real episodes, in the rail frame the panel goal has x
+# fixed at module_width/2 but y FREE over 0.19 m and z jittering 24 mm, because a panel is placed
+# flush against the previously installed one. So `goal = f(rail_a, grasp_offset)` is
+# under-determined by one translational DoF, and the along-rail axis comes from the NEIGHBOUR-EDGE
+# keypoints (5-6) — which are therefore LOAD-BEARING, not a context cue. `rail_a_cam` survives as
+# an aux landmark head (`policy.rail_aux_weight`) and uses a DIFFERENT convention (TCP-anchored
+# delta) — never interchange them. Deploy composes
+#     T_tcp_goal = T_panel_goal @ inv(T_tcp_panel)     (§1.2a, invert=True, settled empirically)
+# Both zarr keys are required; the dataset fails loud if either is missing and verifies the
+# composition against the stored goal at startup (position is the discriminating term).
 
 dataset:
   _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset

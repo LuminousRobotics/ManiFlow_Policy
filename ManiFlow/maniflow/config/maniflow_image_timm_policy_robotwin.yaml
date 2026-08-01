@@ -81,6 +81,10 @@ policy:
   done_loss_weight: 0.0            # done head BCE vs done
   rgb3d_pos_enc: false             # 3D-aware RGB tokens (zero-init xyz patch-pool ADD)
   pointnet_tokens: 16              # K PointNet tokens (4x4 masked-max-pool grid); 1 => legacy
+  # The place head's PRIMARY target is panel_goal_cam (contract §1.2b: rail_a + grasp_offset
+  # leaves the along-rail DoF free by 0.19 m, so rail_a cannot BE the goal). rail_a_cam stays as
+  # an AUX landmark-grounding head weighted at this fraction of place_loss_weight; 0 disables it.
+  rail_aux_weight: 0.25
 
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128

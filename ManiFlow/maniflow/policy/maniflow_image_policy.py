@@ -76,6 +76,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             goal_frame_anneal_epochs=40,       # ... ramped 0 -> max over this many epochs
             phase_loss_weight=0.0,             # phase head CE (0=place_xy, 1=place_z)
             done_loss_weight=0.0,              # done head BCE
+            rail_aux_weight=0.25,              # AUX rail_a_cam head, as a fraction of place_loss_weight
             rgb3d_pos_enc=False,               # 3D-aware RGB tokens (zero-init xyz patch add)
             pointnet_tokens=16,                # K PointNet tokens (4x4 masked-max-pool grid)
             **kwargs):
@@ -411,6 +412,24 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             self.lowdim_type_emb = None
             self.lowdim_mask_token = None
 
+        # --- AUX rail_a head (contract §1.2b) ---------------------------------------------
+        # The PRIMARY place target is now `panel_goal_cam` (the panel's target pose), because
+        # `rail_a` + `grasp_offset` does NOT determine the goal: measured on real episodes, in the
+        # rail frame the panel goal has x fixed at module_width/2 but y FREE OVER 0.19 m and z
+        # jittering 24 mm. A panel is placed flush against the previously installed panel, so the
+        # along-rail DoF comes from the neighbour edge, not the rail. `rail_a_cam` stays wired as
+        # an AUX landmark-grounding target only — it is a real, learnable, geometrically clean
+        # signal that anchors the rail cluster, it just cannot BE the goal.
+        # NOTE THE CONVENTION DIFFERENCE: `panel_goal` is camera-frame-ABSOLUTE, `rail_a` is a
+        # TCP-anchored delta. Separate heads, separate normalizer fields, never interchanged.
+        self.rail_aux_weight = float(rail_aux_weight)
+        if self.h_mode and self.kpt_loss_weight > 0.0 and self.rail_aux_weight > 0.0:
+            self.rail_aux_head = nn.Sequential(
+                nn.LayerNorm(self.n_keypoints * 4),
+                nn.Linear(self.n_keypoints * 4, 256), nn.GELU(), nn.Linear(256, 6))
+        else:
+            self.rail_aux_head = None
+
         # --- observability heads (contract §3.2 / §6.2) -----------------------------------
         # Tiny MLPs off the mean-pooled conditioning context. Both are FREE supervision
         # (phase_id / done ship in the zarr) that forces the context to encode "where in the
@@ -689,8 +708,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         The last-frame-only version threw half the free supervision away.
 
         The PLACE readout is taken from the MOST RECENT frame only: it is the deploy servo
-        target, and deploy always servos on the newest observation.
-        Returns (uv (B,To,N,2), conf (B,To,N), place (B,6), tokens (B,To*N,D), extras)."""
+        target, and deploy always servos on the newest observation. `place` is the normalized
+        `panel_goal_cam` (§1.2b — the panel's target pose, camera-frame-absolute); `rail_aux` is
+        the normalized `rail_a_cam` (a TCP-anchored delta) and is TRAINING-ONLY.
+
+        KEYPOINTS 5-6 ARE LOAD-BEARING, not a minor cue: they are the neighbour-edge points and
+        the ONLY visual source of the along-rail DoF (§1.2b — the panel goal's y is free by
+        0.19 m relative to the rail). Do not down-weight them; when `has_neighbor` is false the
+        converter sets their visibility to 0, so their presence logits double as the model's
+        "is the along-rail DoF observable at all?" signal (and `task` carries the flag on input).
+        Returns (uv, conf, place (B,6), tokens (B,To*N,D), extras); extras['rail_aux'] when built."""
         assert self.kpt_head_hires, "H requires the hires heatmap head (kpt_head_hires=true)"
         B, D = vis_cond.shape[0], vis_cond.shape[-1]
         g = self._kpt_grid
@@ -706,7 +733,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         feat = torch.cat([out["pts3d"], conf_s], dim=-1)              # (B*To,N,4)
         tokens = self.kpt_token_proj(feat) + self.kpt_id_emb.unsqueeze(0)
         tokens = tokens.reshape(B, To * N, D)
-        place = self.goal_from_kpts(feat.reshape(B, To, N, 4)[:, To - 1].reshape(B, -1))
+        last = feat.reshape(B, To, N, 4)[:, To - 1].reshape(B, -1)
+        place = self.goal_from_kpts(last)                             # panel_goal_cam (PRIMARY)
+        if self.rail_aux_head is not None:
+            out["rail_aux"] = self.rail_aux_head(last)                # rail_a_cam (AUX, no export)
         uv = out["uv"].reshape(B, To, N, 2)
         conf = out["conf"].reshape(B, To, N)
         return uv, conf, place, tokens, out
@@ -716,7 +746,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         wrapper cannot drift apart (the F1-depth bug was exactly that drift).
 
         Returns (vis_cond, aux) where aux carries the perception outputs the losses and the
-        exported graph need: place (rail_a_cam, normalized), kpt uv/conf, kpt 3-D, phase, done."""
+        exported graph need: place (`panel_goal_cam`, normalized — the PRIMARY target and the
+        deploy goal source), kpt uv/conf, kpt 3-D, phase, done (+ the training-only rail aux)."""
         B = next(iter(nobs.values())).shape[0]
         this_nobs = {k: v[:, :To] for k, v in nobs.items()}
         vis_cond = self.obs_encoder(this_nobs).reshape(B, -1, self.obs_feature_dim)
@@ -841,7 +872,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             return {
                 'action': action_pred[:, :self.n_action_steps],
                 'action_pred': action_pred,
-                'place_pred': self.normalizer['rail_a'].unnormalize(aux['place']),
+                # `panel_goal_cam`: the panel's target pose in the camera frame. Deploy composes
+                # T_tcp_goal = T_panel_goal @ inv(T_tcp_panel)  (contract §1.2a, invert=True).
+                'place_pred': self.normalizer['panel_goal'].unnormalize(aux['place']),
                 'kpt_uv': torch.cat([aux['kpt_uv'][:, To - 1],
                                      torch.sigmoid(aux['kpt_conf'][:, To - 1]).unsqueeze(-1)],
                                     dim=-1),
@@ -1162,8 +1195,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             R_g_hat = dR @ R_g  =>  v' = M v,  w' = M w   with  M = R_g_hat.T @ R_g
         and in the anchor-camera frame ("C0", where R_g = R_cv0 @ F) the R_cv0 cancels:
             M = F_hat.T @ F.
-        That is why the dataset ships F (and the constant map rail_a -> F_hat) instead of the
-        raw world poses: the whole re-framing is three small matmuls, no pose math in torch.
+        That is why the dataset ships F (and the constant map `panel_goal_cam -> F_hat`) instead
+        of the raw world poses: the whole re-framing is three small matmuls, no pose math in torch.
+        The map composes from the PANEL GOAL, not `rail_a` — `rail_a` + `grasp_offset` leaves the
+        along-rail DoF free by 0.19 m (contract §1.2b), so a rail-derived frame would be wrong by
+        that much whenever the model's y estimate moved.
 
         The self-predicted frame is DETACHED (no second-order gradient through the frame
         construction); the goal-consistency target deliberately is NOT (that loss exists to push
@@ -1178,9 +1214,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if self.action_frame != "goal":
             return out
         B = action.shape[0]
-        # rail_a_cam in RAW units -> X = exp(rail rotvec); F_hat = X @ (the C0 right-multiplier
-        # that realises "(+) grasp_offset", precomputed by the dataset).
-        place_raw = self.normalizer['rail_a'].unnormalize(h_aux['place'])
+        # `panel_goal_cam` in RAW units -> Y = exp(panel-goal rotvec) is the panel goal's
+        # orientation in C0; F_hat = Y @ (the C0 right-multiplier realising
+        # "T_panel_goal @ inv(T_tcp_panel)", precomputed by `panel_to_ee_goal_maps`).
+        place_raw = self.normalizer['panel_goal'].unnormalize(h_aux['place'])
         X = rotvec_to_rotmat(place_raw[..., 3:6])
         F_gt = batch['h_goal_frame'].to(dev).float()
         F_hat = X @ batch['h_gc_Rframe'].to(dev).float()
@@ -1203,9 +1240,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         if self.action_param == "delta" and self.goal_consistency_weight > 0.0:
             # ad(P_0, G_hat, R_g): the remaining transform to the model's OWN goal. P_0 sits at
             # the anchor so its C0 position is 0 by construction (the dataset anchors p at p_ee0).
+            # `h_gc_toff` re-anchors from the CAMERA (where panel_goal_cam lives) to p_ee0.
             p_G = place_raw[..., 0:3] + torch.einsum(
                 'bij,bj->bi', X, batch['h_gc_tvec'].to(dev).float()) \
-                - batch['h_gc_eeoff'].to(dev).float()
+                + batch['h_gc_toff'].to(dev).float()
             R_G = X @ batch['h_gc_Ree'].to(dev).float()
             R0 = batch['h_ee0_rot'].to(dev).float()
             Ft = F_used.transpose(1, 2)
@@ -1438,6 +1476,18 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             N = self.n_keypoints
             dev = self.device
             # ---- keypoints, BOTH obs frames (2x the free supervision of the G1 head) -------
+            # !! DO NOT DOWN-WEIGHT KEYPOINTS 5-6 (`edge_n`, `edge_f` — the NEIGHBOUR EDGE). !!
+            # They look like a minor context cue and they are not: contract §1.2b measured that
+            # the panel goal's position along the rail is FREE BY 0.19 m relative to `rail_a`,
+            # because a panel is placed flush against the previously installed one. The edge
+            # keypoints are the ONLY visual source of that DoF, so they carry a whole
+            # translational axis of the goal. All 7 keypoints are therefore weighted uniformly
+            # here (the per-keypoint visibility mask inside `heatmap_kpt_loss` is the only
+            # modulation, and it exists to suppress genuinely absent points, not to rank them).
+            # When `has_neighbor` is false those two are invisible and the DoF is genuinely
+            # unobservable from the wrist view (~1% of installs): the presence logits learn to
+            # say so, and `task` carries the flag on the input side. Deploy must supply y
+            # externally in that case — see the `place_pred` note in the export report.
             from maniflow.model.vision_2d.heatmap_head import heatmap_kpt_loss
             gt_uv = batch['arm_kpts_uv'][:, :To].to(dev).reshape(-1, N, 3)
             gt_z = batch['arm_kpts_cam'][:, :To, :, 2].to(dev).reshape(-1, N)
@@ -1453,23 +1503,38 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 pxe = torch.linalg.norm((uvp - gt_uv[..., :2]) * scale, dim=-1)
                 kpt_px = float(((pxe * vism).sum() / vism.sum().clamp(min=1)).item())
 
-            # ---- place head: target is rail_a_cam, NOT the composed goal ------------------
-            # rail_a is grasp-offset-free, so the perception head learns a pure visual landmark
-            # and the ACTOR composes goal = rail_a (+) grasp_offset (grasp_off is an obs token,
-            # and the C0 composition maps ride along in the batch). This removes the per-episode
-            # grasp variation (+/-25 cm) from the perception target.
-            rail_norm = self.normalizer['rail_a'].normalize(batch['rail_a']).to(dev)
-            lpl_el = F.smooth_l1_loss(h_aux['place'], rail_norm, reduction='none')
+            # ---- place head: PRIMARY target is panel_goal_cam (§1.2b) ----------------------
+            # NOT rail_a: `rail_a` + `grasp_offset` under-determines the goal by one translational
+            # DoF (y free over 0.19 m along the rail). The panel goal IS what deploy needs
+            # (T_tcp_goal = T_panel_goal @ inv(T_tcp_panel)) and is still grasp-offset-free — a
+            # scene property — which was the reason for moving off the TCP goal in the first place.
+            # `rail_a` stays as a separate AUX head: a clean landmark-grounding signal, DIFFERENT
+            # CONVENTION (TCP-anchored delta vs camera-absolute), never mixed with the primary.
+            pg_norm = self.normalizer['panel_goal'].normalize(batch['panel_goal']).to(dev)
+            lpl_el = F.smooth_l1_loss(h_aux['place'], pg_norm, reduction='none')
             lpl_b = lpl_el.reshape(lpl_el.shape[0], -1).mean(-1)
             keep = 1.0 - batch.get('fov_dropped', torch.zeros_like(lpl_b)).to(lpl_b.dtype)
             lpl = (lpl_b * keep).sum() / keep.sum().clamp(min=1e-6)
             loss = loss + self.place_loss_weight * lpl
             loss_place = float(lpl.item())
+            if self.rail_aux_head is not None and 'rail_aux' in h_aux['kpt_extras']:
+                rail_norm = self.normalizer['rail_a'].normalize(batch['rail_a']).to(dev)
+                lra_b = F.smooth_l1_loss(h_aux['kpt_extras']['rail_aux'], rail_norm,
+                                         reduction='none').reshape(lpl_b.shape[0], -1).mean(-1)
+                lra = (lra_b * keep).sum() / keep.sum().clamp(min=1e-6)
+                loss = loss + self.place_loss_weight * self.rail_aux_weight * lra
+                h_log['loss_rail_aux'] = float(lra.item())
             with torch.no_grad():
-                pl_un = self.normalizer['rail_a'].unnormalize(h_aux['place'])
-                rr = batch['rail_a'].to(dev).reshape(pl_un.shape[0], -1)
-                d = torch.linalg.norm(pl_un[:, :3] - rr[:, :3], dim=-1)
+                pl_un = self.normalizer['panel_goal'].unnormalize(h_aux['place'])
+                pgt = batch['panel_goal'].to(dev).reshape(pl_un.shape[0], -1)
+                d = torch.linalg.norm(pl_un[:, :3] - pgt[:, :3], dim=-1)
                 place_mm = float(((d * keep).sum() / keep.sum().clamp(min=1) * 1000.0).item())
+                # Per-axis error in the CAMERA frame is not the along-rail axis, but a big gap
+                # between place_mm and the kpt error is the first hint that the identifiability
+                # story (§1.2b point 4) is playing out. Logged, not gated.
+                h_log['place_mm_z'] = float(
+                    ((pl_un[:, 2] - pgt[:, 2]).abs() * keep).sum().item()
+                    / max(float(keep.sum().item()), 1.0) * 1000.0)
 
             # ---- observability heads (free supervision, exported for deploy gating) -------
             if self.phase_loss_weight > 0.0:

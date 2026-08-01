@@ -52,16 +52,33 @@ def _quat(R):
     return q if q[0] >= 0 else -q
 
 
-def _episode(rng):
+def _episode(rng, ep_idx=0, n_eps=1):
     """One geometrically-consistent episode. Returns a dict of per-frame arrays."""
-    # --- the goal story: a static rail_a pose + a per-episode grasp offset --------------
+    # --- static rail_a + the per-episode PANEL GOAL, expressed in the rail frame ---------
+    # Contract §1.2b, reproduced faithfully because it is the whole point: in the rail frame the
+    # panel goal has x fixed at module_width/2 but y FREE over ~0.19 m (which slot along the rail
+    # this panel takes — set by the neighbour edge) and z jittering ~24 mm. An episode is
+    # therefore NOT reconstructible from rail_a alone, so the identifiability test below and the
+    # dataset's convention probe are measuring something real rather than a tautology.
     p_railA = np.array([0.6, 0.05, 0.35]) + rng.normal(scale=0.05, size=3)
     R_railA = rotvec_to_rotmat(rng.normal(scale=0.15, size=3))
-    p_off = rng.normal(scale=0.12, size=3)                       # T_tcp_panel translation
-    R_off = rotvec_to_rotmat(rng.normal(scale=0.10, size=3))
-    # panel lands on rail_a  =>  T_world_tcpgoal = T_world_railA @ inv(T_tcp_panel)
-    R_gt = R_railA @ R_off.T
-    p_gt = p_railA - R_railA @ R_off.T @ p_off
+    # y is swept DETERMINISTICALLY across the fixture's episodes rather than sampled, so a
+    # 3-episode fixture still spans the full 0.1913 m and the identifiability test cannot pass
+    # or fail on RNG luck.
+    y_free = -0.09565 + (0.1913 * ep_idx / max(1, n_eps - 1))
+    rail_to_panel = np.array([0.600,                                # module_width/2, CONSTANT
+                              y_free,                               # FREE: 0.1913 m along-rail
+                              float(rng.uniform(-0.012, 0.012))])   # 24 mm hover jitter
+    p_panel_goal = p_railA + R_railA @ rail_to_panel
+    R_panel_goal = R_railA                                          # rail-aligned by construction
+    # --- grasp = T_tcp_panel, ~180 deg like the real data, so the "a 180 deg rotation is its
+    # own inverse -> orientation cannot discriminate the convention" trap (§1.2a) is present.
+    p_off = rng.normal(scale=0.12, size=3)
+    _ax = rng.normal(size=3)
+    R_off = rotvec_to_rotmat(_ax / np.linalg.norm(_ax) * (np.pi + rng.normal(scale=0.02)))
+    # --- contract §1.2a invert=True: T_tcp_goal = T_panel_goal @ inv(T_tcp_panel) ---------
+    R_gt = R_panel_goal @ R_off.T
+    p_gt = p_panel_goal - R_gt @ p_off
     q7_goal = float(rng.uniform(-0.4, 0.4))
 
     # --- trajectory: descend toward the tcp goal, then HOLD for SETTLE frames ----------
@@ -87,8 +104,14 @@ def _episode(rng):
         return anchored_delta(pa, Ra, pb, Rb, Rf)
 
     goal_cam = np.stack([ad(p_tcp[t], R_tcp[t], p_gt, R_gt, R_cv[t]) for t in range(T_EP)])
+    # rail_a_cam: TCP-ANCHORED DELTA (aux target)
     rail_a_cam = np.stack([ad(p_tcp[t], R_tcp[t], p_railA, R_railA, R_cv[t])
                            for t in range(T_EP)])
+    # panel_goal_cam: camera-frame-ABSOLUTE (primary target) — a DIFFERENT convention (§1.2)
+    panel_goal_cam = np.stack([
+        np.concatenate([R_cv[t].T @ (p_panel_goal - p_cam[t]),
+                        fk.rotmat_to_rotvec(R_cv[t].T @ R_panel_goal)])
+        for t in range(T_EP)])
     ego = np.zeros((T_EP, 6), dtype=np.float32)
     for t in range(1, T_EP):
         ego[t] = ad(p_ee[t - 1], R_ee[t - 1], p_ee[t], R_ee[t], R_cv[t - 1])
@@ -129,6 +152,7 @@ def _episode(rng):
         'ee_goal_pos_w': np.tile(p_ee_goal, (T_EP, 1)).astype(np.float32),
         'ee_goal_quat_w': np.tile(_quat(R_ee_goal), (T_EP, 1)).astype(np.float32),
         'q7_goal': np.full((T_EP, 1), q7_goal, dtype=np.float32),
+        'panel_goal_cam': panel_goal_cam.astype(np.float32),
         'rail_a_cam': rail_a_cam.astype(np.float32),
         'grasp_offset': grasp,
         'tcp_egomotion': ego,
@@ -146,7 +170,7 @@ def _episode(rng):
 def build_fixture(path):
     import zarr
     rng = np.random.default_rng(SEED)
-    eps = [_episode(rng) for _ in range(N_EP)]
+    eps = [_episode(rng, e, N_EP) for e in range(N_EP)]
     root = zarr.open(path, mode='w')
     data = root.create_group('data')
     for key in eps[0]:
@@ -262,6 +286,91 @@ def test_tcpcam_formula():
         ad = anchored_delta(p_cam, R_cv, p_ee, R_ee, R_cv)
         assert np.abs(spec - ad).max() < 1e-9, (spec, ad)
     print("  tcpcam: contract formula == anchored_delta(cam, ee, R_cv) to <1e-9 (200 draws)")
+
+
+def test_goal_composition(zarr_path):
+    """Contract §1.2a/§1.2b: the panel-goal composition reproduces the stored ee_link goal, the
+    WRONG convention is hundreds of mm away, and — the trap — ORIENTATION cannot tell them apart.
+    Also checks the rail-based composition is grossly wrong (the landmark, not the sign)."""
+    import zarr as _zarr
+    ds = LumiPlaceImageDataset(
+        zarr_path=zarr_path, horizon=POSE_H, pad_before=1, pad_after=7, seed=SEED,
+        val_ratio=0.0, use_depth=True, depth_input='xyz', n_obs_steps=2, control_hz=CONTROL_HZ,
+        action_param='twist', action_frame='cam0', augmentation=dict(enable=False))
+    assert ds.grasp_offset_invert is fk.GRASP_OFFSET_INVERT is True
+    idxs = list(range(0, T_EP * N_EP, 7))
+    r_ok = [ds._goal_compose_residual(i, True) for i in idxs]
+    r_bad = [ds._goal_compose_residual(i, False) for i in idxs]
+    pos_ok, rot_ok = max(p for _, p in r_ok), max(r for r, _ in r_ok)
+    pos_bad, rot_bad = max(p for _, p in r_bad), max(r for r, _ in r_bad)
+    assert pos_ok < 1e-6, pos_ok                          # fixture uses the rigid form exactly
+    assert pos_bad > 0.05, pos_bad                        # wrong convention: far outside the gate
+    # THE TRAP: the wrong convention barely moves the angle (~180 deg grasp is self-inverse), so
+    # an orientation-only check would have passed it. Assert that explicitly, so nobody "simplifies"
+    # the probe into a rotation comparison later.
+    assert np.degrees(rot_bad) < 5.0, (
+        f"fixture grasp is not ~180 deg: wrong-convention rot err {np.degrees(rot_bad):.2f} deg; "
+        f"the discrimination trap is not being exercised")
+    assert pos_bad / max(pos_ok, 1e-9) > 1e3
+    print(f"  goal composition: invert=True {pos_ok * 1000:.4f} mm / "
+          f"{np.degrees(rot_ok):.5f} deg | invert=False {pos_bad * 1000:.1f} mm / "
+          f"{np.degrees(rot_bad):.3f} deg  <- position discriminates, angle does not")
+
+    # ---- §1.2b identifiability: rail_a + grasp_offset does NOT determine the goal ----------
+    root = _zarr.open(str(zarr_path), mode='r')['data']
+    ends = np.cumsum([T_EP] * N_EP)
+    ys = []
+    for e, end in enumerate(ends):
+        i = int(end) - 1
+        R_cv = quat_wxyz_to_rotmat(root['cam_quat_cv'][i])
+        R_tcp = quat_wxyz_to_rotmat(root['tcp_quat_w'][i])
+        p_tcp = np.asarray(root['tcp_pos_w'][i], np.float64)
+        p_cam = np.asarray(root['cam_pos_w'][i], np.float64)
+        rail = np.asarray(root['rail_a_cam'][i], np.float64)
+        pg = np.asarray(root['panel_goal_cam'][i], np.float64)
+        # invert the TCP-anchored delta: R_railA = (R_cv @ exp(drv) @ R_cv.T) @ R_tcp
+        R_railA = (R_cv @ rotvec_to_rotmat(rail[3:]) @ R_cv.T) @ R_tcp
+        p_railA = p_tcp + R_cv @ rail[:3]
+        p_panel = p_cam + R_cv @ pg[:3]
+        ys.append((R_railA.T @ (p_panel - p_railA)))                     # panel goal IN RAIL FRAME
+    ys = np.stack(ys)
+    spread = ys.max(axis=0) - ys.min(axis=0)
+    assert spread[0] < 1e-6, f"x should be constant (module_width/2): spread {spread[0]}"
+    assert spread[1] > 0.15, f"y must be FREE — this fixture is not exercising §1.2b: {spread[1]}"
+    print(f"  identifiability: panel goal in rail frame — x spread {spread[0] * 1000:.4f} mm "
+          f"(constant), y spread {spread[1] * 1000:.1f} mm (FREE), z spread "
+          f"{spread[2] * 1000:.1f} mm => rail_a alone cannot determine the goal")
+
+
+def test_conventions_not_interchangeable(zarr_path):
+    """`panel_goal_cam` (camera-absolute) and `rail_a_cam` (TCP-anchored delta) are different
+    conventions. Assert they are NOT numerically interchangeable, and that the documented
+    conversion through `tcpcam` is exact — so a future reader cannot 'unify' them."""
+    import zarr as _zarr
+    root = _zarr.open(str(zarr_path), mode='r')['data']
+    gap, worst = 0.0, 0.0
+    for i in range(0, T_EP * N_EP, 5):
+        rail = np.asarray(root['rail_a_cam'][i], np.float64)
+        pg = np.asarray(root['panel_goal_cam'][i], np.float64)
+        gap = max(gap, float(np.linalg.norm(rail[:3] - pg[:3])))
+        # conversion: TCP-anchored delta -> camera-absolute, using ONLY tcpcam-derivable terms
+        R_cv = quat_wxyz_to_rotmat(root['cam_quat_cv'][i])
+        R_ee = quat_wxyz_to_rotmat(root['ee_quat_w'][i])
+        q7 = float(np.asarray(root['q7'][i]).reshape(-1)[0])
+        tcpcam = np.concatenate([R_cv.T @ (np.asarray(root['ee_pos_w'][i], np.float64)
+                                           - np.asarray(root['cam_pos_w'][i], np.float64)),
+                                 fk.rotmat_to_rotvec(R_cv.T @ R_ee)])
+        R_ee_c = rotvec_to_rotmat(tcpcam[3:6])
+        R_tcp_c = R_ee_c @ rotz(q7)                                   # contract §0 inverse
+        p_tcp_c = tcpcam[:3] - R_tcp_c @ np.array([0.0, fk.EE_TCP_Y_OFFSET_M, 0.0])
+        rail_abs = rail[:3] + p_tcp_c                                 # camera-absolute rail pos
+        want = R_cv.T @ (np.asarray(root['tcp_pos_w'][i], np.float64)
+                         + R_cv @ rail[:3] - np.asarray(root['cam_pos_w'][i], np.float64))
+        worst = max(worst, float(np.abs(rail_abs - want).max()))
+    assert gap > 0.05, f"the two targets are suspiciously close ({gap:.3f} m) — check the fixture"
+    assert worst < 1e-5, worst
+    print(f"  conventions: rail_a_cam vs panel_goal_cam differ by up to {gap * 1000:.0f} mm "
+          f"(NOT interchangeable); tcpcam-mediated conversion exact to {worst:.2e}")
 
 
 def test_tcpcam_dataset(zarr_path):
@@ -385,6 +494,17 @@ def test_dataset_and_policy(zarr_path, do_onnx=False):
             # the zero-init 3D-RGB projection must receive gradient (it is on the actor path)
             assert policy.rgb3d_proj.weight.grad is not None
             assert float(policy.rgb3d_proj.weight.grad.abs().max()) > 0.0
+            # §1.2b: the place head targets panel_goal (PRIMARY) and rail_a is a separate AUX
+            # head that must actually be trained, not silently dead.
+            assert 'panel_goal' in policy.normalizer.params_dict
+            assert 'rail_a' in policy.normalizer.params_dict
+            assert policy.rail_aux_head is not None
+            assert float(policy.rail_aux_head[1].weight.grad.abs().max()) > 0.0
+            assert 'loss_rail_aux' in log and np.isfinite(log['loss_rail_aux'])
+            # ... and the two targets must NOT share a normalizer (different conventions)
+            assert not torch.allclose(
+                policy.normalizer.params_dict['panel_goal']['scale'],
+                policy.normalizer.params_dict['rail_a']['scale'])
 
             policy.eval()
             with torch.no_grad():
@@ -452,9 +572,14 @@ def _onnx_check(policy, ds, action_param, action_frame):
                     "action_frame_note", "tcp_from_ee", "camera_K", "control_hz",
                     "train_dt_range_s", "driver_limits", "inference_steps",
                     "anchor_residual_p99_mm", "j7_channel", "camera_frame", "resize_policy",
-                    "units"):
+                    "units", "goal_composition", "place_pred_meaning", "keypoint_order"):
                 assert req in md and md[req] != "", f"metadata_props missing {req}: {md}"
         assert md["contract_version"] == "h1"
+        # §1.2a/§1.2b must travel INSIDE the model: the composition the deploy node applies and
+        # what place_pred actually means (panel goal, not rail_a).
+        assert "inv(T_tcp_panel)" in md["goal_composition"], md["goal_composition"]
+        assert "panel_goal_cam" in md["place_pred_meaning"]
+        assert "edge_n,edge_f" in md["keypoint_order"]
         assert md["action_param"] == action_param and md["action_frame"] == action_frame
         assert md["action_dim"] == "7" and md["tcp_link"] == "ee_link"
         # §3 FINAL: row counts 15/15/15/16, k_start 1/1/1/0, and NO row0_zero key at all
@@ -529,6 +654,9 @@ if __name__ == "__main__":
     tmpd = tempfile.mkdtemp()
     try:
         zp = build_fixture(os.path.join(tmpd, "train.zarr"))
+        print(" goal identifiability + convention (§1.2a/§1.2b):")
+        test_goal_composition(zp)
+        test_conventions_not_interchangeable(zp)
         print(" obs contract:")
         test_tcpcam_dataset(zp)
         print(" legacy regression:")
