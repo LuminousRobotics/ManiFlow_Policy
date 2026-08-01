@@ -209,7 +209,18 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.horizon = horizon
         self.obs_feature_dim = obs_feature_dim
         self.action_dim = action_dim
-        self.n_action_steps = n_action_steps
+        # H: `n_action_steps` is PER-MODE and equals the shipped row count (contract §3 FINAL:
+        # 15/15/15/16). The shared config carries a single scalar (16), which made
+        # `predict_action`'s `[:, :n_action_steps]` a wrong-by-one no-op on the three 15-row
+        # modes — harmless today only because the slice happens to be a full slice, and a trap
+        # the moment anyone lowers it or reads the field as "how many rows does this model
+        # ship". Every H row IS executable (deploy re-plans at k=1..2 by policy, not by tensor
+        # shape), so the honest per-mode value is `action_rows`.
+        self.n_action_steps = self.action_rows if self.h_mode else n_action_steps
+        if self.h_mode and int(n_action_steps) != int(self.action_rows):
+            cprint(f"[H] n_action_steps {int(n_action_steps)} -> {self.action_rows} "
+                   f"(= action_rows for {action_param}/{self.action_frame}; config carries one "
+                   f"scalar for all four modes)", "yellow")
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
         self.language_conditioned = language_conditioned
@@ -712,6 +723,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         `panel_goal_cam` (§1.2b — the panel's target pose, camera-frame-absolute); `rail_aux` is
         the normalized `rail_a_cam` (a TCP-anchored delta) and is TRAINING-ONLY.
 
+        WHICH CAMERA FRAME (contract §9.3): this head sees IMAGE FEATURES ONLY — there is no
+        proprio path into it — so its output can only be expressed in the frame of the pixels it
+        was given, i.e. the camera pose when `head_cam[:, To-1]` was captured. The dataset indexes
+        `panel_goal_cam`/`rail_a_cam`/`arm_kpts_*` at exactly those image frames for the same
+        reason. With the §5 timing augmentation that frame is 0 or 1 control frames before the
+        action anchor; at eval/export/deploy it is the anchor itself.
+
         KEYPOINTS 5-6 ARE LOAD-BEARING, not a minor cue: they are the neighbour-edge points and
         the ONLY visual source of the along-rail DoF (§1.2b — the panel goal's y is free by
         0.19 m relative to the rail). Do not down-weight them; when `has_neighbor` is false the
@@ -874,6 +892,13 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'action_pred': action_pred,
                 # `panel_goal_cam`: the panel's target pose in the camera frame. Deploy composes
                 # T_tcp_goal = T_panel_goal @ inv(T_tcp_panel)  (contract §1.2a, invert=True).
+                # FRAME (contract §9.3): the camera pose at the capture time of the MOST RECENT
+                # INPUT IMAGE (`head_cam[:, To-1]`), not "now" and not the action anchor. At
+                # deploy/eval/export the newest image IS the anchor (image_lag_frames = 0), so
+                # this is the current camera frame; under training's timing augmentation it can
+                # be one control frame back, which is precisely why the labels are indexed there
+                # too. A consumer that lifts place_pred with a camera pose MUST use the pose at
+                # that image's capture time.
                 'place_pred': self.normalizer['panel_goal'].unnormalize(aux['place']),
                 'kpt_uv': torch.cat([aux['kpt_uv'][:, To - 1],
                                      torch.sigmoid(aux['kpt_conf'][:, To - 1]).unsqueeze(-1)],
@@ -1201,6 +1226,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         along-rail DoF free by 0.19 m (contract §1.2b), so a rail-derived frame would be wrong by
         that much whenever the model's y estimate moved.
 
+        FRAME OF `place` (contract §9.3): the place head reads image features only, so its output
+        — and its label — live in the camera frame of the MOST RECENT USED IMAGE, which the §5
+        timing augmentation puts `image_lag_frames` control frames before the anchor. Everything
+        here is expressed in the ANCHOR camera frame C0, so the per-sample constant
+        `h_gc_A = R_cv0.T @ R_cimg` carries the head's output across that one-step camera
+        egomotion. `A` is the identity whenever lag == 0, which is every eval/export/deploy
+        sample — so the deploy-side composition is unchanged by this.
+
         The self-predicted frame is DETACHED (no second-order gradient through the frame
         construction); the goal-consistency target deliberately is NOT (that loss exists to push
         gradient into the place head)."""
@@ -1215,12 +1248,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             return out
         B = action.shape[0]
         # `panel_goal_cam` in RAW units -> Y = exp(panel-goal rotvec) is the panel goal's
-        # orientation in C0; F_hat = Y @ (the C0 right-multiplier realising
-        # "T_panel_goal @ inv(T_tcp_panel)", precomputed by `panel_to_ee_goal_maps`).
+        # orientation in the IMAGE camera frame; A brings it into C0 (see the docstring), and
+        # F_hat = A @ Y @ (the C0 right-multiplier realising "T_panel_goal @ inv(T_tcp_panel)",
+        # precomputed by `panel_to_ee_goal_maps`).
         place_raw = self.normalizer['panel_goal'].unnormalize(h_aux['place'])
         X = rotvec_to_rotmat(place_raw[..., 3:6])
+        A = batch['h_gc_A'].to(dev).float()
         F_gt = batch['h_goal_frame'].to(dev).float()
-        F_hat = X @ batch['h_gc_Rframe'].to(dev).float()
+        F_hat = A @ X @ batch['h_gc_Rframe'].to(dev).float()
         F_used = F_gt
         p = self.goal_frame_self_p()
         if self.training and p > 0.0:
@@ -1241,10 +1276,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             # ad(P_0, G_hat, R_g): the remaining transform to the model's OWN goal. P_0 sits at
             # the anchor so its C0 position is 0 by construction (the dataset anchors p at p_ee0).
             # `h_gc_toff` re-anchors from the CAMERA (where panel_goal_cam lives) to p_ee0.
-            p_G = place_raw[..., 0:3] + torch.einsum(
-                'bij,bj->bi', X, batch['h_gc_tvec'].to(dev).float()) \
+            p_G = torch.einsum(
+                'bij,bj->bi', A,
+                place_raw[..., 0:3] + torch.einsum(
+                    'bij,bj->bi', X, batch['h_gc_tvec'].to(dev).float())) \
                 + batch['h_gc_toff'].to(dev).float()
-            R_G = X @ batch['h_gc_Ree'].to(dev).float()
+            R_G = A @ X @ batch['h_gc_Ree'].to(dev).float()
             R0 = batch['h_ee0_rot'].to(dev).float()
             Ft = F_used.transpose(1, 2)
             out['gc_target'] = torch.cat([
@@ -1578,24 +1615,57 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             if self.action_frame == "goal":
                 pred6 = self._h_goal_integral(rows)
                 tgt6 = h_ref['remaining'][:Bf]
+                # ---- the in-reach mask (contract §9.2) -------------------------------------
                 # Valid ONLY where the horizon reaches the goal (see H_GOAL_INTEGRAL_TOL_M in
                 # the dataset): otherwise sum(v dt) == p_last - p_0 != p_goal - p_0 and the
-                # "constraint" would inject the un-covered distance as an error.
-                m = h_ref['inreach'][:Bf].reshape(-1)
+                # "constraint" would inject the un-covered distance as an error. The dataset
+                # evaluates it against the CLEAN GT goal — against the noised goal a 15 mm
+                # perturbation vs a 5 mm tolerance zeroed it on 100% of measured batches.
+                m_reach = h_ref['inreach'][:Bf].reshape(-1)
+                h_log['goal_reach_frac'] = float(m_reach.mean().item())
+                # `delta`+`goal` needs NO mask for the INTEGRAL: there the "integral" IS row
+                # k=0, and u_0 == ad(P_0, G, R_g) == `remaining` identically — for the noised
+                # goal too, because both sides are built from the same perturbed G (verified to
+                # 1.2e-7). The constraint is an identity, not an approximation, so it holds at
+                # every anchor whether or not the horizon reaches the goal.
+                m_int = (torch.ones_like(m_reach) if self.action_param == "delta" else m_reach)
+                h_log['goal_int_frac'] = float(m_int.mean().item())
+                # A masked-empty batch must NEVER log as 0.0. A zero here reads as "perfect" on
+                # every dashboard and is how a dead flagship loss survived a full training run:
+                # loss_goal_int = 0.0 with mask sum 0, every batch. NaN is the honest value and
+                # `*_frac` says why.
+                n_int = m_int.sum()
+                ok_int = bool(n_int.item() > 0.0)
                 if self.goal_integral_weight > 0.0:
-                    li_el = F.smooth_l1_loss(pred6, tgt6, reduction='none').mean(-1)
-                    li = (li_el * m).sum() / m.sum().clamp(min=1e-6)
-                    loss = loss + self.goal_integral_weight * li
-                    h_log['loss_goal_int'] = float(li.item())
+                    if ok_int:
+                        li_el = F.smooth_l1_loss(pred6, tgt6, reduction='none').mean(-1)
+                        li = (li_el * m_int).sum() / n_int
+                        loss = loss + self.goal_integral_weight * li
+                        h_log['loss_goal_int'] = float(li.item())
+                    else:
+                        h_log['loss_goal_int'] = float('nan')
                 with torch.no_grad():
                     e = torch.linalg.norm(pred6[:, :3] - tgt6[:, :3], dim=-1)
-                    h_log['goal_int_mm'] = float(
-                        ((e * m).sum() / m.sum().clamp(min=1) * 1000.0).item())
+                    h_log['goal_int_mm'] = (
+                        float(((e * m_int).sum() / n_int * 1000.0).item()) if ok_int
+                        else float('nan'))
                 if self.terminal_zero_weight > 0.0:
-                    # terminal settle: the last row must contract to zero (twist -> 0 / u -> 0)
-                    lt = F.smooth_l1_loss(rows[:, -1], torch.zeros_like(rows[:, -1]))
-                    loss = loss + self.terminal_zero_weight * lt
-                    h_log['loss_term'] = float(lt.item())
+                    # Terminal settle: the last row must contract to zero (twist -> 0 / u -> 0)
+                    # — but ONLY for anchors whose horizon actually reaches the goal. EVERY frame
+                    # is a valid anchor, so a mid-episode window's true last row is full descent
+                    # speed (measured: 47.5% of clean samples with |row_15| > 0.01, up to 0.097,
+                    # and a mid-episode batch where 100% of samples had |row_15| = 0.097). Unmasked
+                    # this term does not "encourage settling", it FIGHTS the BC labels on half the
+                    # data. Same clean-goal reach mask as the integral (§9.2).
+                    n_reach = m_reach.sum()
+                    if n_reach.item() > 0.0:
+                        lt_el = F.smooth_l1_loss(rows[:, -1], torch.zeros_like(rows[:, -1]),
+                                                 reduction='none').mean(-1)
+                        lt = (lt_el * m_reach).sum() / n_reach
+                        loss = loss + self.terminal_zero_weight * lt
+                        h_log['loss_term'] = float(lt.item())
+                    else:
+                        h_log['loss_term'] = float('nan')
                 if h_ref['gc_target'] is not None and self.goal_consistency_weight > 0.0:
                     # ties row 0 to the model's OWN goal estimate -> the action loss becomes a
                     # supervisor of the place head (the anti-shortcut mechanism)
