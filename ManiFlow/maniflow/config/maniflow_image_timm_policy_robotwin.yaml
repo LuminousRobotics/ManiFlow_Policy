@@ -62,6 +62,25 @@ policy:
   n_keypoints: 7                   # converter N_KEYPOINTS (rail samples + tube)
   kpt_head_hires: false            # G1: 56x56 deconv heatmap head + log-z -> N 3-D point tokens
   pointnet_dim: 0                  # F1-depth: PointNet on the xyz point-map -> 3D token; 0 => off
+  # --- H-series (v10): ee_link action space + goal-frame anchoring (contract §3/§4/§7).
+  # action_param: null keeps EVERY prior arm bit-identical (the whole H chassis stays off).
+  # The four arms: H0 twist/cam0 . H1 twist/goal . H-delta delta/cam0 . H1-delta delta/goal.
+  # robotwin_task.dataset.action_param / .action_frame MUST match — the policy asserts that the
+  # row count it predicts equals the row count the dataset emits.
+  action_param: null               # null | "twist" | "delta"
+  action_frame: "cam0"             # "cam0" | "goal"
+  control_hz: 10.0                 # Delta t = 1/control_hz for the twist rows + integral
+  rot_integral_approx: false       # ablation: small-angle SUM instead of SO(3) composition
+  goal_integral_weight: 0.0        # goal-coincidence integral constraint (goal frames only)
+  terminal_zero_weight: 0.0        # terminal settle ||row_last||         (goal frames only)
+  goal_consistency_weight: 0.0     # ||u_0 - ad(P_0, G_hat, R_g)||        (delta+goal only)
+  action_rate_weight: 0.05         # sum_k ||row_k - row_{k-1}||^2 (executability; H only)
+  goal_frame_self_p_max: 0.0       # scheduled sampling on the OUTPUT frame: max self-prob
+  goal_frame_anneal_epochs: 40     # ... ramped 0 -> max over this many epochs
+  phase_loss_weight: 0.0           # phase head CE vs phase_id (0=place_xy, 1=place_z)
+  done_loss_weight: 0.0            # done head BCE vs done
+  rgb3d_pos_enc: false             # 3D-aware RGB tokens (zero-init xyz patch-pool ADD)
+  pointnet_tokens: 16              # K PointNet tokens (4x4 masked-max-pool grid); 1 => legacy
 
   diffusion_timestep_embed_dim: 128
   diffusion_target_t_embed_dim: 128

@@ -1,0 +1,132 @@
+# Lumi place-policy H-SERIES task (converter v10 / CONVERTER_VERSION 2.4.0).
+# Selected via: robotwin_task=lumi_place_v4
+#
+# Normative spec: policy-training-pipeline/docs/h_series_interface_contract.md (§1/§3/§4/§5).
+# The 2x2 of arms is chosen with TWO knobs (both set per-run from training_config):
+#     policy.action_param  = twist | delta        # what the 6 DoF mean
+#     policy.action_frame  = cam0  | goal         # which frame they are expressed in
+#     robotwin_task.dataset.action_param / .action_frame   (must MATCH the policy — the policy
+#                                                           asserts the row count agrees)
+#   H0       twist/cam0   H1       twist/goal   H-delta  delta/cam0   H1-delta delta/goal
+#
+# ACTION SPACE (contract §0/§3): the 6-DoF part acts on **ee_link**, the J7-invariant IK tip the
+# real robot servos, so a 6-DoF delta/twist is executable by J1..J6 BY CONSTRUCTION. dJ7 is a
+# separate POSITIONAL channel (J7's Maxon is on a position service). Ground truth (goals, place
+# error, keypoints) stays in tcp_link; ee_link is only the action/proprio frame.
+# `horizon` = 16 POSES => 15 executable rows (16 for delta+goal, whose row 0 is the remaining
+# transform rather than a structural zero). The policy derives the row count; do not set it.
+#
+# DEPTH ROUTING (unchanged from the g1/pn lineage, deliberately): depth IS emitted
+# (depth_input=xyz -> obs['depth_cam'] is a camera-frame (X,Y,Z,valid) point map) but depth_cam
+# is NOT in shape_meta, so the 2-D encoder never builds a depth trunk — the routing our C2 xyz
+# run proved the model ignores. Instead depth_cam feeds (a) the PointNet K-token branch, (b) the
+# keypoint head's metric z-fusion, and (c) the 3D-aware RGB positional add. Consumers outside
+# the encoder need depth_cam as an EXPLICIT ONNX input (src/export_onnx.py adds it) — that was
+# the F1-depth silent-disable bug; keep the mechanism intact.
+
+name: lumi_place_v4
+
+shape_meta:
+  obs:
+    head_cam:
+      shape: [3, 224, 224]     # 98 tokens (2 frames x 49) + the 3D-aware positional ADD (§4.1)
+      type: rgb
+      horizon: ${n_obs_steps}
+    # ---- typed low-dim tokens (§4): one token per physical quantity per obs frame, each with
+    # a learned type-ID embedding in the policy. NO prev_action (free-run collapse verdict),
+    # NO goal_prior (G0 verdict), NO suction (always-on => zero variance), and NEVER the goal
+    # frame (it is an OUTPUT coordinate system).
+    agent_pos:
+      shape: [7]               # measured joint positions [rad]                        -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    task:
+      shape: [1]               # [neighbor_present]                                    -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    grasp_off:
+      shape: [7]               # episode-constant T_tcp_panel [xyz, quat wxyz]         -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    ego:
+      shape: [6]               # measured ee_link displacement over the prev interval   -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    twist:
+      shape: [6]               # instantaneous ee_link twist J(q).qdot, camera frame    -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    tcpcam:
+      shape: [7]               # ee_link CONFIGURATION in the camera frame + q7         -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    dt:
+      shape: [1]               # TRUE obs image gap [s] (timing aug, §5)                -> 2
+      type: low_dim
+      horizon: ${n_obs_steps}
+    twist_hist:
+      shape: [5, 6]            # 50 Hz micro-history, most-recent frame only            -> 5
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [7]                 # [6-DoF ee_link part | dJ7]; rows derived from the mode
+    horizon: ${horizon}
+
+# Token budget (contract §4): 98 RGB + 14 kpt (7 x BOTH obs frames) + 16 PointNet
+# + 19 low-dim = 147 of 256 (visual_cond_len 128 x n_obs_steps 2). The policy asserts this.
+
+dataset:
+  _target_: maniflow.dataset.lumi_place_image_dataset.LumiPlaceImageDataset
+  zarr_path: ???               # override at launch: robotwin_task.dataset.zarr_path=...
+  horizon: ${horizon}          # POSES (16); the dataset derives the window (19) and row count
+  pad_before: ${eval:'${n_obs_steps}-1'}   # raised internally to cover the timing aug (=3)
+  pad_after: ${eval:'${n_action_steps}-1'} # raised internally to H-1 so every frame is an anchor
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  use_depth: true
+  depth_input: xyz             # 4-ch camera-frame point map [X/scale, Y/scale, Z/scale, valid]
+  n_obs_steps: ${n_obs_steps}
+  control_hz: 10.0
+  action_param: ???            # twist | delta  (MUST match policy.action_param)
+  action_frame: cam0           # cam0  | goal   (MUST match policy.action_frame)
+  augmentation:
+    enable: true
+    gpu_offload: true          # RGB photometric on the CUDA batch; depth aug stays CPU here
+    depth_noise_sigma0: 0.005
+    depth_px_dropout: 0.02
+    depth_flying_px: 0.005
+    depth_episode_dropout: 0.1
+    latency_shift_prob: 0.5
+    # SO(2) roll stays OFF: co-rotating the per-pixel xyz point map AND every camera-frame
+    # goal-frame tensor is not implemented, and a partial co-rotation would silently de-register
+    # the labels. The dataset asserts rot_aug_deg == 0 in H mode.
+    rot_aug_deg: 0.0
+    photo_brightness: 0.3
+    photo_contrast: 0.3
+    photo_saturation: 0.3
+    photo_hue: 0.08
+    photo_blur_p: 0.3
+    photo_noise: 0.02
+    photo_erase_p: 0.3
+    fov_dropout_p: 0.2         # G1 FOV-dropout: blindness can strike anywhere
+    # ---- H timing augmentation (contract §5). Eval/val/export use the nominal gap 1 / lag 0
+    # automatically (augment=False on the val split), so these only shape training.
+    obs_gap_probs: [0.1, 0.7, 0.2]   # previous obs image 0 / 1 / 2 control frames back
+    image_lag_probs: [0.6, 0.4]      # both images 0 / 1 frames before the action anchor
+    # ---- H per-key proprio DR (contract §4.3). Per-key BLOCK MASKING lives in the policy
+    # (proprio_mask_p) because it substitutes a learned mask token.
+    proprio_noise_joint_deg: 0.7
+    proprio_noise_twist_frac: 0.05
+    proprio_noise_ego_mm: 1.0
+    # ---- H1 scheduled sampling on the OUTPUT frame (contract §3.3); inert for cam0 arms
+    goal_frame_noise_mm: 15.0
+    goal_frame_noise_deg: 1.5
+    # ---- schema keys kept so hydra struct mode accepts per-run overrides -----------------
+    agent_pos_noise_deg: 0.0
+    agent_pos_mask_p: 0.0
+    goal_prior_noise_mm: 0.0
+    goal_prior_noise_deg: 0.0
+    goal_prior_drop_p: 0.0
+    prev_action_noise_mm: 0.0
+    prev_action_noise_deg: 0.0
